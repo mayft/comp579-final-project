@@ -1,28 +1,91 @@
-from collections import namedtuple
 import numpy as np
 import math
 #from tqdm import tqdm
 #import torch
 
-
-State = namedtuple('State', ['id','neighbors'])
-
-'''odd row:
-     * *
-   * 0 *
-     * *
-    even row:
-   * *
-   * 0 *
-   * *
-    
+'''
+hexgrid coordinate system
+odd row:    even row:
+     * *    * *
+   * 0 *    * 0 *
+     * *    * * 
+     
+    \|\|\|
+    -0-0-0-
+    |/|/|/
+   -0-0-0-
+    |\|\|
 '''
 
+'''
+env:
+    arch:
+        physical grid (states and transitions)
+        allowable actions
+        hyperparameters
+    instance:
+        state mapping
+        action mapping
+        
+        reward function
+        terminal states
+        current state
+        *goal state
+        
+        *hidden,unseen,seen partition
+        *filter function
+    
+    run:
+        reset -> new env
+        step
+        initial
+        
+    sample:
+        new env - state, action, wall, filter
+        mst
+        generate memory bank
+        generate query
+        generate sample
+
+training:
+    eswm:
+        base
+        output layers
+        embedding
+        
+        padding mask
+        query mask
+        output mask
+        input shaping - binary states
+        loss fn
+        
+    epn:
+        impala
+        env wrapper
+        epn agent
+        
+    Dyna:
+        eswm model - modified??
+        Dyna model
+        train loop
+                 
+modelling:
+    display:
+         grid image fn
+         pygame update state for video?
+    record:
+        loss
+        accuracies
+    experiments:
+        navigation
+        adaptability
+        planning 
+    
+'''
 class Environment:
-    def __init__(self, side_length=3,add_wall=False,seed=10,bin_states=False, hidden=0):
+    def __init__(self, side_length=3,add_wall=False,seed=10, hidden=0,possible_states=64):
         self.rng = np.random.default_rng(seed=seed)
         self.len = side_length
-        self.bin_states = bin_states
         self.action_map={0:'NE',1:'E',2:'SE',3:'SW',4:'W',5:'NW'}
         self.actions = {v:k for k,v in self.action_map.items()}
         self.states = {}
@@ -37,6 +100,7 @@ class Environment:
         self.hidden_locations = []
         self.observations = []
         self.unseen_prob =0.68 if add_wall else 1
+        self.possible_states = possible_states
 
         width = side_length
         offset = side_length
@@ -112,7 +176,7 @@ class Environment:
                 if a not in self.hidden_locations or b not in self.hidden_locations:
                     self.hidden_edges.append((a,b))
 
-    def get_transition(self,e,masked=None):
+    def get_transition(self,e):
 
         actions = []
         a,b= e
@@ -142,35 +206,19 @@ class Environment:
                 else:
                     actions = [0,3]#[(a, 0, b), (b, 3, a)]
 
-        #return self.rng.choice(actions,axis=0)
         if self.rng.integers(2):
             return [b,actions[1],a]
         else:
             return [a, actions[0], b]
-        '''if masked is not None:
-            masked_transition = transition.copy()
-            if masked == 1:
-                masked_transition[1] = [0]
-            else:
-                masked_transition[masked] = self.observations[0]
-            return np.concat(masked_transition), np.concat(transition)'''
 
-        #return np.concat(transition)
-
-    # should i add option to sample higher values?
-    def sample_env(self,odd=False):
-        s = [self.rng.permutation(len(self.locations))*2+1]
-        if odd:
-            s[0] = s[0]+1
-        if self.bin_states:
-            s = [np.frombuffer(format(i, '06b').encode("ascii"), dtype="u1") - 48 for i in s[0]]
+    def sample_env(self):
+        s = self.rng.permutation(self.possible_states)
         self.observations = dict(zip(self.locations, s))
-        #self.observations[0] = np.zeros(6) if self.bin_states else [0]
 
     def mst(self):
         V = len(self.locations)
         weights = sorted(self.rng.random(len(self.obs_edges)))
-        edges = zip(weights,self.rng.permutation(self.obs_edges))
+        edges = zip(weights,self.rng.permutation(self.obs_edges).tolist())
         parent = list(range(V))
         rank = [1]*V
         cost = []
@@ -203,32 +251,35 @@ class Environment:
                     break
         return cost
 
-    def generate_memory_bank(self,n_samples:int,odd=False):
+    def generate_memory_bank(self,n_samples:int):
         banks = []
-        mask = self.rng.integers(low=0,high=3,size=n_samples)
+        mask = np.zeros([n_samples,len(self.locations)])
         for i in range(n_samples):
             self.filter_observable(self.hidden)
             edges = self.mst()
 
             unseen = list(set(self.obs_edges)-set(edges))
 
-            self.sample_env(odd=odd)
+            self.sample_env()
             if self.walls:
                 self.build_wall()
             #trans = [self.get_transition(e) for e in edges]
             trans = []
-            for e in edges:
+            for j,e in enumerate(edges):
                 t= self.get_transition(e)
+
                 if t[0] not in self.wall:
                     if t[2] in self.wall:
                         t[2] = t[0]
-                    trans.append(np.concat([self.observations[t[0]], [t[1]], self.observations[t[2]]]))
-
-            trans = self.rng.permutation(trans)
+                    trans.append(np.hstack([self.observations[t[0]], [t[1]], self.observations[t[2]]]))
+                else:
+                    mask[i,j]=float('-inf')
+                    trans.append([0]*3)
+            order = self.rng.permutation(len(trans))
+            trans = np.array(trans)[order]
+            mask[i,:-1]= mask[i,:-1][order]
 
             pick = self.rng.random()
-            #print(pick)
-            #print()
             if pick < self.unseen_prob:
                 #q = self.rng.choice(unseen, axis=0)
                 t_set = unseen
@@ -250,12 +301,11 @@ class Environment:
                 q[1] = (q[1]+3)%6
             elif q[2] in self.wall:
                 q[2] = q[0]
-            q = np.concat([self.observations[q[0]], [q[1]], self.observations[q[2]]])
+            q = np.hstack([self.observations[q[0]], [q[1]], self.observations[q[2]]])
 
             trans = np.concat([trans,[q]],axis=0)
             banks.append(trans)
         return np.array(banks),mask
-
 
 
 if __name__ == '__main__':
