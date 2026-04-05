@@ -155,7 +155,6 @@ def train(environment,batch_size=128,device='mps',epochs=10,num_layers=10,filena
                 acc = accuracy(p,t)
                 outputs = (loss, *acc)
                 file.write(out_format % outputs)
-                file.flush()
 
         if epoch % 1000==0:
             file.flush()

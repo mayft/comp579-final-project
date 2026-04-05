@@ -1,0 +1,26 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+type: command
+description: Distributed Training for ESWM and Dyna-Q
+experiment_name: eswm-distributed-replication
+code: ./src 
+environment: azureml:AzureML-pytorch-1.13-ubuntu20.04-py39-cuda11-gpu@latest
+compute: azureml:t4-spot-cluster 
+
+distribution:
+  type: pytorch
+  process_count_per_instance: 1
+resources:
+  instance_count: 4 
+
+# PERMANENT CLOUD STORAGE MOUNT
+outputs:
+  cloud_checkpoint_dir:
+    type: uri_folder
+    # This points to your permanent Workspace Blob Storage
+    path: azureml://datastores/workspaceblobstore/paths/eswm_project/checkpoints
+    # rw_mount means "Read/Write Mount". It acts like a live USB drive.
+    mode: rw_mount
+
+# Pass the mounted path into your Python script as an argument
+command: >-
+  python train.py --checkpoint_dir ${{outputs.cloud_checkpoint_dir}}
