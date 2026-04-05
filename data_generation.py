@@ -3,6 +3,7 @@ import math
 #from tqdm import tqdm
 #import torch
 
+
 '''
 hexgrid coordinate system
 odd row:    even row:
@@ -83,7 +84,7 @@ modelling:
     
 '''
 class Environment:
-    def __init__(self, side_length=3,add_wall=False,seed=10, hidden=0,possible_states=64):
+    def __init__(self, side_length=3,add_wall=False,seed=123, hidden=0,possible_states=64,render=False):
         self.rng = np.random.default_rng(seed=seed)
         self.len = side_length
         self.action_map={0:'NE',1:'E',2:'SE',3:'SW',4:'W',5:'NW'}
@@ -99,8 +100,19 @@ class Environment:
         self.obs_locations = []
         self.hidden_locations = []
         self.observations = []
-        self.unseen_prob =0.68 if add_wall else 1
-        self.possible_states = possible_states
+        self.unseen_prob =1#0.68 if add_wall else 1
+        self.possible_states = [i for i in range(possible_states) if i % 3]
+        self.test_states = [i for i in range(possible_states) if not i % 3]
+        self.render_mode = render
+        self.directions = [0,1,2]
+
+        self.window=None
+        self.window_size=500
+        self.clock=None
+        self.size=2*side_length-1
+        self._agent_location=side_length*100
+        self._target_location=(np.array([1,1]))
+        self.metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
 
         width = side_length
         offset = side_length
@@ -211,8 +223,11 @@ class Environment:
         else:
             return [a, actions[0], b]
 
-    def sample_env(self):
-        s = self.rng.permutation(self.possible_states)
+    def sample_env(self,test):
+        if test:
+            s= self.rng.permutation(self.test_states)
+        else:
+            s = self.rng.permutation(self.possible_states)
         self.observations = dict(zip(self.locations, s))
 
     def mst(self):
@@ -251,16 +266,17 @@ class Environment:
                     break
         return cost
 
-    def generate_memory_bank(self,n_samples:int):
+    def generate_memory_bank(self,n_samples,test=False):
         banks = []
         mask = np.zeros([n_samples,len(self.locations)])
         for i in range(n_samples):
             self.filter_observable(self.hidden)
             edges = self.mst()
+            self.memory = edges
 
             unseen = list(set(self.obs_edges)-set(edges))
 
-            self.sample_env()
+            self.sample_env(test)
             if self.walls:
                 self.build_wall()
             #trans = [self.get_transition(e) for e in edges]
@@ -273,7 +289,7 @@ class Environment:
                         t[2] = t[0]
                     trans.append(np.hstack([self.observations[t[0]], [t[1]], self.observations[t[2]]]))
                 else:
-                    mask[i,j]=float('-inf')
+                    mask[i,j]=1
                     trans.append([0]*3)
             order = self.rng.permutation(len(trans))
             trans = np.array(trans)[order]
@@ -305,11 +321,160 @@ class Environment:
 
             trans = np.concat([trans,[q]],axis=0)
             banks.append(trans)
-        return np.array(banks),mask
+            self.bank=trans
+        return np.array(banks),mask==1
+
+    def move(self,action):
+        new_state = self.states[self._agent_location][action]
+        if new_state:
+            self._agent_location=new_state
+
+    def render(self):
+        import pygame
+        if self.render_mode:
+            running = True
+            while running:
+                self._render_frame()
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        return None
+                    if event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_SPACE:
+                            return None
+                        if event.key == pygame.K_n:
+                            self.generate_memory_bank(1)
+                        if event.key == pygame.K_w:
+                            self.move(5)
+                        if event.key == pygame.K_e:
+                            self.move(0)
+                        if event.key == pygame.K_d:
+                            self.move(1)
+                        if event.key == pygame.K_x:
+                            self.move(2)
+                        if event.key == pygame.K_z:
+                            self.move(3)
+                        if event.key == pygame.K_a:
+                            self.move(4)
+
+    def coords(self,state):
+        coords= np.array([state//100,state%100],dtype=float)
+        if coords[1]%2 and self.len%2:
+            coords[0]+=0.5
+        elif not coords[1]%2 and not self.len%2:
+            coords[0]-=0.5
+        return coords+0.5
+    def _render_frame(self):
+        import pygame
+        if self.window is None and self.render_mode == "human":
+            pygame.init()
+            #pygame.display.init()
+            self.window = pygame.display.set_mode(
+                (self.window_size, self.window_size)
+            )
+        if self.clock is None and self.render_mode == "human":
+            self.clock = pygame.time.Clock()
+
+        canvas = pygame.Surface((self.window_size, self.window_size))
+        canvas.fill((255, 255, 255))
+        pix_square_size = (
+                self.window_size // (self.size)
+        )  # The size of a single grid square in pixels
+
+        # First we draw the target
+        # Convert [row, col] to pygame (x, y) by reversing the coordinates
+        for loc in self.locations:
+            square = self.coords(loc)-0.5
+            color = [0,120,0]
+            if (loc//100)%2:
+                color[1] +=50
+            if loc%2:
+
+                color[1]-=20
+
+            pygame.draw.rect(
+                canvas,
+                color,
+                pygame.Rect(
+                    square * pix_square_size,
+                    (pix_square_size, pix_square_size),
+                ),
+            )
+
+        for state in self.wall:
+            pygame.draw.rect(
+                canvas,
+                (50,50,50),
+                pygame.Rect(
+                    (self.coords(state)-0.5) * pix_square_size,
+                    (pix_square_size, pix_square_size),
+                ),
+            )
+
+        for s, edges in self.states.items():
+            start = self.coords(s)*pix_square_size
+            for e in edges:
+                if (s,e) in self.memory or (e,s) in self.memory:
+                    end = self.coords(e)*pix_square_size
+                    pygame.draw.line(
+                        canvas,
+                        0,
+                        start,
+                        end,
+                        width=3,
+                    )
+
+        for i, (s1,e,s2) in enumerate(self.bank):
+
+            a = next((k for k, v in self.observations.items() if v == s1), None)
+            b = next((k for k, v in self.observations.items() if v == s2), None)
+            color=(0,0,255)
+            if i == len(self.bank)-1:
+                color = (255,0,0)
+            if a==b:
+                b= self.states[a][e]
+                color = (100,100,100)
+            pygame.draw.line(
+                canvas,
+                color,
+                self.coords(a)*pix_square_size,
+                self.coords(b)*pix_square_size,
+                width=3,
+            )
+
+        # Now we draw the agent
+        pygame.draw.circle(
+            canvas,
+            (100, 0, 50),
+            self.coords(self._agent_location) * pix_square_size,
+            pix_square_size / 3,
+        )
+
+        running = True
+        if self.render_mode == "human":
+
+            # The following line copies our drawings from `canvas` to the visible window
+            self.window.blit(canvas, canvas.get_rect())
+            #pygame.event.pump()
+
+
+
+            pygame.display.update()
+
+
+            # We need to ensure that human-rendering occurs at the predefined framerate.
+            # The following line will automatically add a delay to keep the framerate stable.
+            self.clock.tick(self.metadata["render_fps"])
+
+        else:  # rgb_array
+            return np.transpose(
+                np.array(pygame.surfarray.pixels3d(canvas)), axes=(1, 0, 2)
+            )
 
 
 if __name__ == '__main__':
-    env = Environment(side_length=3)
+    env = Environment(side_length=4,render='human',add_wall=True,hidden=5,possible_states=37)
+    env.generate_memory_bank(1)
+    env.render()
 
 
 

@@ -64,6 +64,7 @@ class EPN(Model):
 def get_batch(env, batch_size):
     x, m = env.generate_memory_bank(batch_size)
     x = tf.convert_to_tensor(x)
+    print(x)
     #y = x[:,-1,:]
     #xmask  = tf.expand_dims(tf.one_hot(tf.convert_to_tensor(m),3),axis=1)
 
@@ -74,7 +75,7 @@ def get_batch(env, batch_size):
     for i in range(mask.shape[1]):
         mask[m[i],i,:] = 0
     mask = mask ==1'''
-    return x,#y, #xmask,mask
+    return x#y, #xmask,mask
 
 if __name__ == "__main__":
     env =Environment()
