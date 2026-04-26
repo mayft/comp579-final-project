@@ -22,7 +22,7 @@ from data_generation import Environment
 
 class ESWMGymEnv(gym.Env):
     def __init__(self, env_config=None):
-        self.env = Environment(side_length=3, add_wall=True, hidden=0, possible_states=64)
+        self.env = Environment(side_length=4, add_wall=True, hidden=5, possible_states=37)
         
         self.action_space = Discrete(6)
         
@@ -30,31 +30,30 @@ class ESWMGymEnv(gym.Env):
         self.current_step = 0
         
         self.seq_length = len(self.env.locations) + 1 
-        self.observation_space = Box(low=-np.inf, high=np.inf, shape=(self.seq_length, 13), dtype=np.float32)
+        # 3 dimensions: (source_index, action_index, end_index)
+        self.observation_space = Box(low=0, high=40, shape=(self.seq_length, 3), dtype=np.float32)
 
     def _get_obs(self):
-        """Formats the memory bank and the current goal into the 13-dim structure."""
-        obs = np.zeros((self.seq_length, 13), dtype=np.float32)
+        """Formats the memory bank and the current goal into the 3-dim structure."""
+        obs = np.zeros((self.seq_length, 3), dtype=np.float32)
         
-        # 1. Fill the memory bank transitions
+        # Fill the memory bank transitions
         for i, (s1_val, action, s2_val) in enumerate(self.env.bank):
             if i >= self.seq_length - 1:
                 break
             
-            s1_loc = next((k for k, v in self.env.observations.items() if v == s1_val), None)
-            s2_loc = next((k for k, v in self.env.observations.items() if v == s2_val), None)
-            
-            if s1_loc is not None and s2_loc is not None:
-                obs[i, 0:6] = self.env.states[s1_loc]
-                obs[i, 6] = action
-                obs[i, 7:13] = self.env.states[s2_loc]
+            # Use raw indices rather than the binary states
+            obs[i, 0] = s1_val
+            obs[i, 1] = action
+            obs[i, 2] = s2_val
                 
         current_loc = self.env._agent_location
         target_loc = self.env._target_location
         
-        obs[-1, 0:6] = self.env.states[current_loc]
-        obs[-1, 6] = 0 # Dummy action since this row represents the goal condition
-        obs[-1, 7:13] = self.env.states[target_loc]
+        # Append the target condition using observations
+        obs[-1, 0] = self.env.observations[current_loc]
+        obs[-1, 1] = 0 # Dummy action
+        obs[-1, 2] = self.env.observations[target_loc]
         
         return obs
 
@@ -110,27 +109,24 @@ class ESWMGymEnv(gym.Env):
 def env_creator(env_config):
     return ESWMGymEnv(env_config)
 
-class OpenWorld(Model):
+class RandomWall(Model):
     def __init__(self):
         super().__init__()
-        self.source_embed = layers.Embedding(2, 128)
-        self.end_embed = layers.Embedding(2, 128)
-        self.action_embed = layers.Embedding(6, 768)
+        # Embedding sizes matched to PyTorch RandomWall (39, 8, 39 to 1024)
+        self.source_embed = layers.Embedding(39, 1024, mask_zero=True)
+        self.action_embed = layers.Embedding(8, 1024, mask_zero=True)
+        self.end_embed = layers.Embedding(39, 1024, mask_zero=True)
 
     def call(self, x):
-        raw_start = x[:, :, 0:6]
-        raw_action = x[:, :, 6]
-        raw_end = x[:, :, 7:13]
-
-        start_idx = tf.cast(raw_start > 0, tf.int32)
-        end_idx = tf.cast(raw_end > 0, tf.int32)
-        action_idx = tf.cast(raw_action, tf.int32)
-
-        start = tf.concat([self.source_embed(start_idx[:, :, i]) for i in range(6)], axis=-1)
-        action = self.action_embed(action_idx)
-        end = tf.concat([self.end_embed(end_idx[:, :, i]) for i in range(6)], axis=-1)
+        # Cast observations to integer indices
+        x = tf.cast(x, tf.int32)
+        
+        start = self.source_embed(x[:, :, 0])
+        action = self.action_embed(x[:, :, 1])
+        end = self.end_embed(x[:, :, 2])
         
         return tf.reduce_mean(tf.stack([start, action, end], axis=0), axis=0)
+    
 class EPN(Model):
     def __init__(self, sa_iterations, input_dim, num_outputs):
         super().__init__()
@@ -186,9 +182,8 @@ class RLlibEPNModel(TFModelV2):
         super().__init__(obs_space, action_space, num_outputs, model_config, name)
         
         sa_iters = model_config.get("custom_model_config", {}).get("sa_iterations", 6)
-        input_dim = model_config.get("custom_model_config", {}).get("input_dim", 768)
-        
-        self.embed = OpenWorld()
+        input_dim = model_config.get("custom_model_config", {}).get("input_dim", 1024)
+        self.embed = RandomWall()
         
         self.epn = EPN(sa_iters, input_dim, num_outputs)
         self._value_out = None
@@ -237,7 +232,7 @@ if __name__ == "__main__":
                 "custom_model": "epn_rllib_model",
                 "custom_model_config": {
                     "sa_iterations": 4, 
-                    "input_dim": 768
+                    "input_dim": 1024
                 }
             }
         )
