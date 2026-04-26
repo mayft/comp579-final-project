@@ -1,8 +1,9 @@
 import numpy as np
 import math
-#from tqdm import tqdm
-#import torch
-
+import gymnasium as gym
+from gymnasium.core import ObsType, ActType, RenderFrame
+from gymnasium.spaces import Discrete, Graph
+from enum import Enum
 
 '''
 hexgrid coordinate system
@@ -10,15 +11,7 @@ odd row:    even row:
      * *    * *
    * 0 *    * 0 *
      * *    * * 
-     
-    \|\|\|
-    -0-0-0-
-    |/|/|/
-   -0-0-0-
-    |\|\|
-'''
 
-'''
 env:
     arch:
         physical grid (states and transitions)
@@ -83,28 +76,41 @@ modelling:
         planning 
     
 '''
-class Environment:
-    def __init__(self, side_length=3,add_wall=False,seed=123, hidden=0,possible_states=64,render=False):
+
+class Actions(Enum):
+    NE = 0
+    E = 1
+    SE = 2
+    SW = 3
+    W = 4
+    NW = 5
+
+class Environment(gym.Env):
+    def __init__(self, side_length=3,add_wall=False,seed=123, hidden=0,possible_states=64,render=None,query_all=False):
         self.rng = np.random.default_rng(seed=seed)
         self.len = side_length
-        self.action_map={0:'NE',1:'E',2:'SE',3:'SW',4:'W',5:'NW'}
-        self.actions = {v:k for k,v in self.action_map.items()}
+        self.hidden = hidden
+        self.has_walls = add_wall
+        self.render_mode = render
+        self.num_states = 0
+        #self.action_map={0:'NE',1:'E',2:'SE',3:'SW',4:'W',5:'NW'}
+        #self.actions = {v:k for k,v in self.action_map.items()}
         self.states = {}
         self.locations = []
         self.edges = []
-        self.hidden = hidden
-        self.walls= add_wall
+
         self.wall = []
         self.obs_edges = []
         self.hidden_edges = []
-        self.obs_locations = []
-        self.hidden_locations = []
-        self.observations = []
-        self.unseen_prob =1#0.68 if add_wall else 1
-        self.possible_states = [i for i in range(possible_states) if i % 3]
-        self.test_states = [i for i in range(possible_states) if not i % 3]
-        self.render_mode = render
-        self.directions = [0,1,2]
+        self.seen = []
+        self.unseen = []
+        self.observations = {}
+
+
+        self.possible_states = range(possible_states) if possible_states<60 else [i for i in range(possible_states) if i % 3]
+        self.test_states = [] if possible_states<60 else [i for i in range(possible_states) if not i % 3]
+        self.query_probs = [0.68,0.15,0.17] if query_all else [1,0,0]
+        self.make_grid()
 
         self.window=None
         self.window_size=500
@@ -112,49 +118,58 @@ class Environment:
         self.size=2*side_length-1
         self._agent_location=side_length*100
         self._target_location=(np.array([1,1]))
-        self.metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
+        self.step_limit = None
+        self.step_count = 0
+        self.reset()
 
-        width = side_length
-        offset = side_length
-        if side_length%2:
-            offset-=0.5
-        for i in range(2*side_length-1):
-            for j in range(math.floor(offset-width/2), math.floor(offset+width/2)):
-                loc = j*100+i
+        self.metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
+        self.action_space = Discrete(6)
+        self.observation_space = Discrete(self.num_states)
+
+    def make_grid(self):
+        width = self.len
+        offset = self.len
+        if self.len % 2:
+            offset -= 0.5
+        for i in range(2 * self.len - 1):
+            for j in range(math.floor(offset - width / 2), math.floor(offset + width / 2)):
+                loc = j * 100 + i
                 self.locations.append(loc)
                 self.states[loc] = np.zeros(6)
-                idx = (j-1)*100+i
+                idx = (j - 1) * 100 + i
                 if idx in self.states.keys():
                     self.states[loc][4] = idx
                     self.states[idx][1] = loc
 
-                if j != math.floor(offset-width/2):
-                    self.edges.append(((j-1)*100+i,loc))
+                if j != math.floor(offset - width / 2):
+                    self.edges.append(((j - 1) * 100 + i, loc))
 
-                if i !=0:
-                    corner = j-1+(i%2)
-                    if j!=math.floor(offset-width/2) or i >= side_length:
-                        self.edges.append((corner*100+i-1,loc))
-                        idx = corner*100+i-1
+                if i != 0:
+                    corner = j - 1 + (i % 2)
+                    if j != math.floor(offset - width / 2) or i >= self.len:
+                        self.edges.append((corner * 100 + i - 1, loc))
+                        idx = corner * 100 + i - 1
                         if idx in self.states.keys():
                             self.states[loc][5] = idx
                             self.states[idx][2] = loc
-                    if j+1 < math.floor(offset+width/2) or i >= side_length:
-                        self.edges.append(((corner+1)*100+i-1,loc))
-                        idx=(corner+1)*100+i-1
+                    if j + 1 < math.floor(offset + width / 2) or i >= self.len:
+                        self.edges.append(((corner + 1) * 100 + i - 1, loc))
+                        idx = (corner + 1) * 100 + i - 1
                         if idx in self.states.keys():
                             self.states[loc][0] = idx
                             self.states[idx][3] = loc
 
-            if i >= side_length-1:
-                width-=1
+            if i >= self.len - 1:
+                width -= 1
             else:
-                width+=1
+                width += 1
+        self.num_states = len(self.locations)
 
-    def build_wall(self):
+    def build_wall(self,test):
         start = self.rng.choice(self.locations)
         self.wall = [start]
-        d = self.rng.integers(1,[6,3,4,4])
+        #direction 1, direction 2, length 1, length 2
+        d = self.rng.integers(1,[6,3,6,4])
         d[1]  = (d[0]+2+self.rng.integers(3))%6
         s = start
         for i in range(d[2]):
@@ -163,30 +178,30 @@ class Environment:
                 self.wall.append(s)
             else:
                 break
-        s = start
-        for i in range(d[3]):
-            s = self.states[s][d[1]]
-            if s in self.locations:
-                self.wall.append(s)
-            else:
-                break
+        if test:
+            s = start
+            for i in range(d[3]):
+                s = self.states[s][d[1]]
+                if s in self.locations:
+                    self.wall.append(s)
+                else:
+                    break
 
     def filter_observable(self,num_hidden):
         self.obs_edges = self.edges.copy()
-        self.obs_locations = self.locations.copy()
-        self.hidden_locations = []
-        self.hidden_edges = []
-        if num_hidden == 0:
-            return
+        if num_hidden == 0: return
+        observable = list(filter(lambda x: x not in self.wall,self.locations))
         num_hidden=self.rng.integers(num_hidden)+1
-        for i in range(num_hidden):
-            v = self.obs_locations.pop()
-            self.hidden_locations.append(v)
+        hidden_locations = self.rng.choice(observable,num_hidden,replace=False)
+        self.hidden_edges = []
+        ignore = []
         for (a,b) in self.obs_edges:
-            if a in self.hidden_locations or b in self.hidden_locations:
-                self.obs_edges.remove((a,b))
-                if a not in self.hidden_locations or b not in self.hidden_locations:
-                    self.hidden_edges.append((a,b))
+            if a in hidden_locations or b in hidden_locations:
+                self.hidden_edges.append((a,b))
+                if a in hidden_locations and b in hidden_locations:
+                    ignore.append((a,b))
+        self.obs_edges = list(filter(lambda x: x not in self.hidden_edges,self.obs_edges))
+        self.hidden_edges = list(filter(lambda x: x not in ignore, self.hidden_edges))
 
     def get_transition(self,e):
 
@@ -231,7 +246,7 @@ class Environment:
         self.observations = dict(zip(self.locations, s))
 
     def mst(self):
-        V = len(self.locations)
+        V = self.num_states
         weights = sorted(self.rng.random(len(self.obs_edges)))
         edges = zip(weights,self.rng.permutation(self.obs_edges).tolist())
         parent = list(range(V))
@@ -266,83 +281,89 @@ class Environment:
                     break
         return cost
 
-    def generate_memory_bank(self,n_samples,test=False):
+    def new_environment(self,test_states=False):
+        self.filter_observable(self.hidden)
+        if self.has_walls:
+            self.sample_env(test=False)
+            self.build_wall(test_states)
+        else:
+            self.sample_env(test_states)
+
+    def generate_memory_bank(self):
+        paths = self.mst()
+        self.seen = paths
+
+        trans = []
+        for e in paths:
+            t= self.get_transition(e)
+
+            if t[0] not in self.wall:
+                if t[2] in self.wall:
+                    t[2] = t[0]
+                trans.append(np.hstack([self.observations[t[0]], [t[1]], self.observations[t[2]]]))
+
+        self.unseen = list(set(self.obs_edges)-set(self.seen))
+        trans = self.rng.permutation(trans)
+        #trans = np.array(trans)[order]
+        #mask[i,:-1]= mask[i,:-1][order]
+
+        #self.memory = trans
+        return trans
+
+    def get_query(self,transition_set):
+        if transition_set == 'unseen':
+            transitions = self.unseen
+        elif transition_set == 'seen':
+            transitions = self.seen
+        else:
+            transitions = self.hidden_edges
+        q = self.rng.choice(transitions, axis=0)
+
+        while q[0] in self.wall and q[1] in self.wall:
+            q = self.rng.choice(transitions, axis=0)
+
+        q = self.get_transition(q)
+
+        if q[0] in self.wall:
+            q[0] = q[2]
+            q[1] = (q[1] + 3) % 6
+        elif q[2] in self.wall:
+            q[2] = q[0]
+
+        q = np.hstack([self.observations[q[0]], [q[1]], self.observations[q[2]]])
+        return q
+
+    def sample_environments(self,n_samples,kind='unseen',test=False):
         banks = []
-        mask = np.zeros([n_samples,len(self.locations)])
         for i in range(n_samples):
-            self.filter_observable(self.hidden)
-            edges = self.mst()
-            self.memory = edges
-
-            unseen = list(set(self.obs_edges)-set(edges))
-
-            self.sample_env(test)
-            if self.walls:
-                self.build_wall()
-            #trans = [self.get_transition(e) for e in edges]
-            trans = []
-            for j,e in enumerate(edges):
-                t= self.get_transition(e)
-
-                if t[0] not in self.wall:
-                    if t[2] in self.wall:
-                        t[2] = t[0]
-                    trans.append(np.hstack([self.observations[t[0]], [t[1]], self.observations[t[2]]]))
-                else:
-                    mask[i,j]=1
-                    trans.append([0]*3)
-            order = self.rng.permutation(len(trans))
-            trans = np.array(trans)[order]
-            mask[i,:-1]= mask[i,:-1][order]
-
-            pick = self.rng.random()
-            if pick < self.unseen_prob:
-                #q = self.rng.choice(unseen, axis=0)
-                t_set = unseen
-            elif pick < 0.83:
-                #q = self.rng.choice(edges, axis=0)
-                t_set = edges
-            else:
-                t_set = self.hidden_edges
-
-            q = self.rng.choice(t_set, axis=0)
-
-            while q[0] in self.wall and q[1] in self.wall:
-                q = self.rng.choice(t_set, axis=0)
-
-            q = self.get_transition(q)
-
-            if q[0] in self.wall:
-                q[0] = q[2]
-                q[1] = (q[1]+3)%6
-            elif q[2] in self.wall:
-                q[2] = q[0]
-            q = np.hstack([self.observations[q[0]], [q[1]], self.observations[q[2]]])
-
-            trans = np.concat([trans,[q]],axis=0)
-            banks.append(trans)
-            self.bank=trans
-        return np.array(banks),mask==1
+            self.new_environment(test)
+            bank = self.generate_memory_bank()
+            query = self.get_query(kind)
+            bank = np.concatenate([bank, [query]], axis=0)
+            banks.append(bank)
+        return banks
 
     def move(self,action):
         new_state = self.states[self._agent_location][action]
-        if new_state:
+        if new_state and new_state not in self.wall :
             self._agent_location=new_state
 
     def render(self):
         import pygame
+        query = None
         if self.render_mode:
             running = True
             while running:
-                self._render_frame()
+                self._render_frame(query)
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
-                        return None
+                        return
                     if event.type == pygame.KEYDOWN:
                         if event.key == pygame.K_SPACE:
-                            return None
+                            return
                         if event.key == pygame.K_n:
-                            self.generate_memory_bank(1)
+                            self.reset()
+                            self.generate_memory_bank()
                         if event.key == pygame.K_w:
                             self.move(5)
                         if event.key == pygame.K_e:
@@ -355,6 +376,15 @@ class Environment:
                             self.move(3)
                         if event.key == pygame.K_a:
                             self.move(4)
+                        if event.key == pygame.K_3:
+                            query = self.get_query('unsolvable')
+                            print(query)
+                        if event.key == pygame.K_1:
+                            query = self.get_query('seen')
+                            print(query)
+                        if event.key == pygame.K_2:
+                            query = self.get_query('unseen')
+                            print(query)
 
     def coords(self,state):
         coords= np.array([state//100,state%100],dtype=float)
@@ -363,7 +393,8 @@ class Environment:
         elif not coords[1]%2 and not self.len%2:
             coords[0]-=0.5
         return coords+0.5
-    def _render_frame(self):
+
+    def _render_frame(self,query):
         import pygame
         if self.window is None and self.render_mode == "human":
             pygame.init()
@@ -377,7 +408,7 @@ class Environment:
         canvas = pygame.Surface((self.window_size, self.window_size))
         canvas.fill((255, 255, 255))
         pix_square_size = (
-                self.window_size // (self.size)
+                self.window_size // self.size
         )  # The size of a single grid square in pixels
 
         # First we draw the target
@@ -413,7 +444,7 @@ class Environment:
         for s, edges in self.states.items():
             start = self.coords(s)*pix_square_size
             for e in edges:
-                if (s,e) in self.memory or (e,s) in self.memory:
+                if e:#(s,e) in self.seen or (e,s) in self.seen:
                     end = self.coords(e)*pix_square_size
                     pygame.draw.line(
                         canvas,
@@ -423,24 +454,56 @@ class Environment:
                         width=3,
                     )
 
-        for i, (s1,e,s2) in enumerate(self.bank):
+        for (s1,s2) in self.seen:
+            if s1 not in self.wall or s2 not in self.wall:
+                #a = next((k for k, v in self.observations.items() if v == s1), None)
+                #b = next((k for k, v in self.observations.items() if v == s2), None)
+                a=s1
+                b=s2
+                color=(0,0,255)
+                pygame.draw.line(
+                    canvas,
+                    color,
+                    self.coords(a)*pix_square_size,
+                    self.coords(b)*pix_square_size,
+                    width=3,
+                )
+        for (s1,s2) in self.unseen:
+            if s1 not in self.wall or s2 not in self.wall:
+                a = s1#next((k for k, v in self.observations.items() if v == s1), None)
+                b = s2#next((k for k, v in self.observations.items() if v == s2), None)
+                color=(100,100,0)
+                pygame.draw.line(
+                    canvas,
+                    color,
+                    self.coords(a)*pix_square_size,
+                    self.coords(b)*pix_square_size,
+                    width=3,
+                )
+        for (s1,s2) in self.hidden_edges:
+            if s1 not in self.wall or s2 not in self.wall:
+                a = s1#next((k for k, v in self.observations.items() if v == s1), None)
+                b = s2#next((k for k, v in self.observations.items() if v == s2), None)
+                color=(100,100,100)
+                pygame.draw.line(
+                    canvas,
+                    color,
+                    self.coords(a)*pix_square_size,
+                    self.coords(b)*pix_square_size,
+                    width=3,
+                )
+        
+        if query is not None:
+            a = next((k for k, v in self.observations.items() if v == query[0]), None)
+            b = next((k for k, v in self.observations.items() if v == query[2]), None)
 
-            a = next((k for k, v in self.observations.items() if v == s1), None)
-            b = next((k for k, v in self.observations.items() if v == s2), None)
-            color=(0,0,255)
-            if i == len(self.bank)-1:
-                color = (255,0,0)
-            if a==b:
-                b= self.states[a][e]
-                color = (100,100,100)
             pygame.draw.line(
                 canvas,
-                color,
-                self.coords(a)*pix_square_size,
-                self.coords(b)*pix_square_size,
+                (255,0,0),
+                self.coords(a) * pix_square_size,
+                self.coords(b) * pix_square_size,
                 width=3,
             )
-
         # Now we draw the agent
         pygame.draw.circle(
             canvas,
@@ -465,15 +528,42 @@ class Environment:
             # The following line will automatically add a delay to keep the framerate stable.
             self.clock.tick(self.metadata["render_fps"])
 
-        else:  # rgb_array
+        '''else:  # rgb_array
             return np.transpose(
                 np.array(pygame.surfarray.pixels3d(canvas)), axes=(1, 0, 2)
-            )
+            )'''
 
+    def _get_obs(self):
+        return {'agent':self._agent_location,'target':self._target_location}
+
+    def reset(self,seed=None,options=None):
+        super().reset(seed=seed)
+        self.step_count=0
+        self.new_environment()
+        # when implementing ensure states are different and allowed
+        self._agent_location = self.rng.choice(self.locations)
+        self._target_location = self.rng.choice(self.locations)
+        observation = self._get_obs()
+        info = None
+
+        return observation,info
+
+    def step(self, action):
+        self.move(action)
+        self.step_count +=1
+        terminated = (self._agent_location==self._target_location)
+        truncated = (self.step_count >= self.step_limit) if self.step_limit is not None else False
+        observation = self._get_obs()
+        info = None
+        reward = 1 if terminated else -0.01
+        return observation,reward,terminated,truncated,info
 
 if __name__ == '__main__':
-    env = Environment(side_length=4,render='human',add_wall=True,hidden=5,possible_states=37)
-    env.generate_memory_bank(1)
+    env = Environment(side_length=4,render='human',add_wall=True,hidden=5,possible_states=37,query_all=True)
+    #env = Environment(side_length=4,possible_states=37,render='human')
+    #env = Environment(render='human')
+    env.reset()
+    env.generate_memory_bank()
     env.render()
 
 
