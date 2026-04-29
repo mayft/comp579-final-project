@@ -23,7 +23,6 @@ from data_generation import Environment
 class ESWMGymEnv(gym.Env):
     def __init__(self, env_config=None):
         self.env = Environment(side_length=4, add_wall=True, hidden=5, possible_states=37)
-        
         self.action_space = Discrete(6)
         
         self.max_steps = 200
@@ -42,18 +41,18 @@ class ESWMGymEnv(gym.Env):
             if i >= self.seq_length - 1:
                 break
             
-            # Use raw indices rather than the binary states
-            obs[i, 0] = s1_val
-            obs[i, 1] = action
-            obs[i, 2] = s2_val
+            # NOTE: Adding +1 to states so '0' is strictly used for padding masking!
+            obs[i, 0] = s1_val + 1
+            obs[i, 1] = action + 1 
+            obs[i, 2] = s2_val + 1
                 
         current_loc = self.env._agent_location
         target_loc = self.env._target_location
         
         # Append the target condition using observations
-        obs[-1, 0] = self.env.observations[current_loc]
-        obs[-1, 1] = 0 # Dummy action
-        obs[-1, 2] = self.env.observations[target_loc]
+        obs[-1, 0] = self.env.observations[current_loc] + 1
+        obs[-1, 1] = 7 # Dummy action (Ensure this matches padding expectations)
+        obs[-1, 2] = self.env.observations[target_loc] + 1
         
         return obs
 
@@ -61,9 +60,9 @@ class ESWMGymEnv(gym.Env):
         super().reset(seed=seed)
         self.current_step = 0
         
-        # Generate a new random environment layout and memory bank
-        self.env.rng = np.random.default_rng(seed=seed)
-        self.env.generate_memory_bank(1)
+        self.env.reset(seed=seed)
+        
+        self.env.bank = self.env.generate_memory_bank()
         
         # Pick a random start and target location that are NOT in the wall
         valid_locations = [loc for loc in self.env.locations if loc not in self.env.wall]
@@ -71,7 +70,6 @@ class ESWMGymEnv(gym.Env):
         if len(valid_locations) >= 2:
             self.env._agent_location, self.env._target_location = random.sample(valid_locations, 2)
         else:
-            # Fallback if the wall completely fills the map (highly unlikely in normal generation)
             self.env._agent_location = self.env.locations[0]
             self.env._target_location = self.env.locations[-1]
         
@@ -80,11 +78,8 @@ class ESWMGymEnv(gym.Env):
     def step(self, action):
         self.current_step += 1
 
-        
-        intended_state = self.env.states[self.env._agent_location][action]
-        
-        if intended_state and intended_state not in self.env.wall:
-            self.env._agent_location = intended_state
+        # While manual moving works, you can also just use the base env's move logic:
+        self.env.move(action)
             
         obs = self._get_obs()
         
@@ -218,11 +213,11 @@ if __name__ == "__main__":
         .environment("eswm_env") 
         .framework("tf2", eager_tracing=True) 
         .resources(
-            num_gpus=1,             
+            num_gpus=2,             
             num_cpus_per_worker=1 
         )
         .env_runners(
-            num_env_runners=60,  
+            num_env_runners=30,  
             rollout_fragment_length=200 
         )
         .training(
@@ -242,15 +237,20 @@ if __name__ == "__main__":
 
     tune.run(
         "IMPALA",
+        name="epn_baseline_run", # CRITICAL: Gives Ray a folder name to look for when resuming
+        resume="AUTO",           # CRITICAL: Tells Ray to fetch the latest checkpoint from Azure if it exists
         config=config.to_dict(),
-        stop={"timesteps_total": 285000000},
-        checkpoint_freq=100,
+        stop={"training_iteration": 23750},
+        
+        # Checkpointing Strategy
+        checkpoint_freq=100,     # Saves every ~1.2M steps
+        checkpoint_at_end=True,  # Ensures the very final step is saved
         
         storage_path=AZURE_URI, 
         
         sync_config=SyncConfig(
-            sync_period=300,      # Sync to Azure every 5 minutes (standard)
-            sync_artifacts=True   # Ensures MLflow artifacts also move to the cloud
+            sync_period=300,
+            sync_artifacts=True
         ),
         
         callbacks=[

@@ -18,5 +18,5 @@ RUN pip install --no-cache-dir \
 WORKDIR /app
 
 # Copy the training script and environment module into the container
-COPY src/epn/epn.py /app/epn.py
-COPY src/epn/data_generation.py /app/data_generation.py
+COPY epn.py /app/epn.py
+COPY data_generation.py /app/data_generation.py
