@@ -1,0 +1,284 @@
+import os
+import csv
+import numpy as np
+from collections import deque
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+
+from data_generation import Environment
+
+# Force Pygame to run headlessly just in case env.render() is called
+os.environ["SDL_VIDEODRIVER"] = "dummy"
+
+class RandomWall(nn.Module):
+    def __init__(self):
+        super(RandomWall, self).__init__()
+        self.source_embed = nn.Embedding(39, 1024, padding_idx=0)
+        self.action_embed = nn.Embedding(8, 1024, padding_idx=0)
+        self.end_embed = nn.Embedding(39, 1024, padding_idx=0)
+
+    def forward(self, x, mask=None):
+        x = x + 2
+        start = self.source_embed(x[:, :, 0])
+        action = self.action_embed(x[:, :, 1])
+        end = self.end_embed(x[:, :, 2])
+        return torch.mean(torch.stack([start, action, end], dim=0), dim=0)
+
+class ESWM(nn.Module):
+    def __init__(self, embedder, num_layers=2, input_dim=1024, num_heads=8, feedforward=2048, dropout=0.1, state_dim=38, num_actions=7):
+        super(ESWM, self).__init__()
+        self.embedding = embedder
+        self.transformer = nn.TransformerEncoderLayer(d_model=input_dim, nhead=num_heads, dim_feedforward=feedforward, dropout=dropout, batch_first=True)
+        self.model = nn.TransformerEncoder(encoder_layer=self.transformer, num_layers=num_layers)
+        self.source = nn.Linear(input_dim, state_dim)
+        self.action = nn.Linear(input_dim, num_actions)
+        self.end = nn.Linear(input_dim, state_dim)
+
+    def forward(self, x, padding_mask, transition_mask=None):
+        src = self.embedding(x)
+        src = self.model(src, src_key_padding_mask=padding_mask)
+        query = src[:, -1]
+        return self.source(query), self.action(query), self.end(query)
+
+class BaselineA2CAgent(nn.Module):
+    def __init__(self, num_states=39, num_actions=6):
+        super(BaselineA2CAgent, self).__init__()
+        self.embed_s_prev = nn.Embedding(num_states, 128)
+        self.embed_a_prev = nn.Embedding(num_actions + 1, 128)
+        self.embed_s_curr = nn.Embedding(num_states, 128)
+        self.embed_s_goal = nn.Embedding(num_states, 128)
+        self.lstm = nn.LSTM(input_size=128, hidden_size=256, num_layers=1, batch_first=True)
+        self.actor_head = nn.Linear(256, num_actions)
+        self.critic_head = nn.Linear(256, 1)
+        
+    def forward(self, history_sequence):
+        e_s_prev = self.embed_s_prev(history_sequence[:, :, 0])
+        e_a_prev = self.embed_a_prev(history_sequence[:, :, 1])
+        e_s_curr = self.embed_s_curr(history_sequence[:, :, 2])
+        e_s_goal = self.embed_s_goal(history_sequence[:, :, 3])
+        merged_obs = (e_s_prev + e_a_prev + e_s_curr + e_s_goal) / 4.0
+        lstm_out, _ = self.lstm(merged_obs)
+        final_hidden = lstm_out[:, -1, :] 
+        return self.actor_head(final_hidden), self.critic_head(final_hidden)
+
+class ESWMDynaQAgent:
+    def __init__(self, num_states, num_actions, eswm_model, alpha=0.1, gamma=0.95, epsilon=0.1, n_planning=5):
+        self.Q = {}
+        self.num_actions = num_actions
+        self.alpha = alpha
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.n = n_planning
+        self.eswm = eswm_model
+        self.memory_bank = []
+        self.observed_states = []
+        self.observed_actions = {}
+        
+    def get_q(self, state):
+        if state not in self.Q: self.Q[state] = np.zeros(self.num_actions)
+        return self.Q[state]
+        
+    def select_action(self, state):
+        if np.random.rand() < self.epsilon: return np.random.choice(self.num_actions)
+        return np.argmax(self.get_q(state))
+        
+    def step(self, state, action, reward, next_state, target_loc, device='cpu'):
+        q_next = self.get_q(next_state)
+        td_target = reward + self.gamma * np.max(q_next)
+        self.get_q(state)[action] += self.alpha * (td_target - self.get_q(state)[action])
+        
+        transition = [state, action, next_state]
+        if transition not in self.memory_bank:
+            self.memory_bank.append(transition)
+            if state not in self.observed_states:
+                self.observed_states.append(state)
+                self.observed_actions[state] = []
+            if action not in self.observed_actions[state]:
+                self.observed_actions[state].append(action)
+                
+        if len(self.observed_states) > 0 and self.n > 0:
+            self._plan(target_loc, device)
+            
+    def _plan(self, target_loc, device):
+        self.eswm.eval()
+        for _ in range(self.n):
+            sim_s = np.random.choice(self.observed_states)
+            sim_a = np.random.choice(self.observed_actions[sim_s])
+            sim_s_prime = self._query_eswm(sim_s, sim_a, device)
+            sim_reward = 1.0 if sim_s_prime == target_loc else -0.01
+            
+            q_sim_next = self.get_q(sim_s_prime)
+            sim_td_target = sim_reward + self.gamma * np.max(q_sim_next)
+            self.get_q(sim_s)[sim_a] += self.alpha * (sim_td_target - self.get_q(sim_s)[sim_a])
+
+    def _query_eswm(self, start_state, action, device):
+        loc_to_idx = {loc: idx for idx, loc in enumerate(sorted(list(self.Q.keys()) + [start_state]))}
+        idx_to_loc = {idx: loc for loc, idx in loc_to_idx.items()}
+        
+        mapped_memory = [[loc_to_idx.get(s1, 0), a, loc_to_idx.get(s2, 0)] for s1, a, s2 in self.memory_bank]
+        query = [loc_to_idx.get(start_state, 0), action, 0] 
+        seq = mapped_memory + [query]
+        x = torch.tensor([seq], dtype=torch.long, device=device)
+        padding_mask = torch.zeros((1, len(seq)), dtype=torch.bool, device=device)
+        
+        with torch.no_grad():
+            _, _, out_end = self.eswm(x, padding_mask)
+            
+        predicted_idx = torch.argmax(out_end[0, -1]).item()
+        return idx_to_loc.get(predicted_idx, start_state)
+
+def run_sample_efficiency_test(env, eswm_model, episodes=100, max_steps=100, device='cpu'):
+    print("\n--- Running Sample Efficiency Test ---")
+    n_values = [0, 5, 20]
+    all_results = {}
+    
+    for n in n_values:
+        print(f"Training ESWM-Dyna-Q with n={n}...")
+        agent = ESWMDynaQAgent(env.num_states, 6, eswm_model, n_planning=n)
+        steps_history = []
+        for ep in range(episodes):
+            env.reset()
+            state, target = env._agent_location, env._target_location
+            steps = 0
+            while state != target and steps < max_steps:
+                action = agent.select_action(state)
+                env.move(action)
+                next_state = env._agent_location
+                reward = 1.0 if next_state == target else -0.01
+                agent.step(state, action, reward, next_state, target, device)
+                state = next_state
+                steps += 1
+            steps_history.append(steps)
+        all_results[f'n={n}'] = steps_history
+        
+    plt.figure(figsize=(10, 5))
+    with open('sample_efficiency_data.csv', 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Episode', 'n=0_Steps', 'n=5_Steps', 'n=20_Steps'])
+        for i in range(episodes):
+            writer.writerow([i+1, all_results['n=0'][i], all_results['n=5'][i], all_results['n=20'][i]])
+            
+    for n, data in all_results.items():
+        smoothed = [np.mean(data[max(0, i-10):i+1]) for i in range(len(data))]
+        plt.plot(smoothed, label=f'Dyna-Q ({n})')
+        
+    plt.title('Sample Efficiency: Impact of ESWM Planning Steps')
+    plt.xlabel('Episodes')
+    plt.ylabel('Steps to Goal (Smoothed)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('sample_efficiency_graph.png', dpi=300)
+    plt.close()
+
+def run_adaptability_test(env, baseline_model, eswm_agent, trials=100, device='cpu'):
+    print("\n--- Running Adaptability Test (Sudden Obstacles) ---")
+    env.reset()
+    baseline_success, eswm_success = [], []
+    
+    valid_locs = [l for l in env.locations if l not in env.wall]
+    new_obstacles = np.random.choice(valid_locs, size=3, replace=False)
+    env.wall.extend(new_obstacles)
+    print(f"Added 3 new unexpected obstacles: {new_obstacles}")
+    
+    loc_to_idx = {loc: idx for idx, loc in enumerate(env.locations)}
+    
+    for _ in range(trials):
+        safe_locs = [l for l in env.locations if l not in env.wall]
+        start, goal = np.random.choice(safe_locs, size=2, replace=False)
+        
+        env._agent_location, env._target_location = start, goal
+        b_state, b_prev_a = start, 6
+        history = []
+        b_success = 0
+        for _ in range(50):
+            history.append([loc_to_idx.get(b_state,0), b_prev_a, loc_to_idx.get(b_state,0), loc_to_idx.get(goal,0)])
+            hist_tensor = torch.tensor([history], dtype=torch.long).to(device)
+            logits, _ = baseline_model(hist_tensor)
+            action = torch.argmax(logits).item()
+            env.move(action)
+            if env._agent_location == goal:
+                b_success = 1
+                break
+            b_prev_a, b_state = action, env._agent_location
+        baseline_success.append(b_success)
+        
+        env._agent_location, env._target_location = start, goal
+        e_state = start
+        e_success = 0
+        for _ in range(50):
+            action = eswm_agent.select_action(e_state)
+            env.move(action)
+            next_state = env._agent_location
+            reward = 1.0 if next_state == goal else -0.01
+            eswm_agent.step(e_state, action, reward, next_state, goal, device)
+            if next_state == goal:
+                e_success = 1
+                break
+            e_state = next_state
+        eswm_success.append(e_success)
+
+    with open('adaptability_data.csv', 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Trial', 'Baseline_Success', 'ESWM_Success'])
+        for i in range(trials):
+            writer.writerow([i+1, baseline_success[i], eswm_success[i]])
+
+    plt.figure(figsize=(6, 5))
+    bars = plt.bar(['Baseline A2C', 'ESWM Dyna-Q'], 
+                   [np.mean(baseline_success), np.mean(eswm_success)], 
+                   color=['#FF9999', '#66B2FF'])
+    plt.title('Adaptability to 3 New Obstacles')
+    plt.ylabel('Success Rate')
+    plt.ylim(0, 1.1)
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, yval + 0.02, f'{yval*100:.1f}%', ha='center')
+    plt.savefig('adaptability_graph.png', dpi=300)
+    plt.close()
+
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Executing Pipeline on: {device}")
+
+    env = Environment(side_length=4, add_wall=True, possible_states=37)
+    
+    # Load Baseline Model
+    baseline_model = BaselineA2CAgent(num_states=len(env.locations), num_actions=6).to(device)
+    if os.path.exists('baseline_a2c.pth'):
+        print("Loading pre-trained Baseline A2C...")
+        baseline_model.load_state_dict(torch.load('baseline_a2c.pth', map_location=device))
+        baseline_model.eval()
+    else:
+        print("WARNING: 'baseline_a2c.pth' missing. Baseline will act randomly.")
+
+    # Load ESWM Model
+    eswm_params = {'embedder': RandomWall(), 'input_dim': 1024, 'state_dim': 38, 'num_actions': 7}
+    eswm_model = ESWM(num_layers=2, **eswm_params).to(device)
+    
+    if os.path.exists('wall.pth'):
+        print("Loading pre-trained ESWM weights...")
+        checkpoint = torch.load('wall.pth', map_location=device)
+        state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+        eswm_model.load_state_dict(state_dict)
+        eswm_model.eval()
+    else:
+        print("WARNING: 'wall.pth' missing. ESWM will hallucinate random noise.")
+
+    #  Run Tests
+    run_sample_efficiency_test(env, eswm_model, device=device)
+    
+    dyna_q_agent = ESWMDynaQAgent(env.num_states, 6, eswm_model, n_planning=10)
+    run_adaptability_test(env, baseline_model, dyna_q_agent, device=device)
+
+    # 5. Download Results (if on Colab)
+    try:
+        from google.colab import files
+        print("\nDownloading evaluation results...")
+        files.download('sample_efficiency_graph.png')
+        files.download('sample_efficiency_data.csv')
+        files.download('adaptability_graph.png')
+        files.download('adaptability_data.csv')
+    except ImportError:
+        print("\nTests complete. Results saved locally.")
