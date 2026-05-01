@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 # Import the environment and models from your provided scripts
 from data_generation import Environment 
-from eswm import ESWM, RandomWall ,OpenWorld
+from eswm.eswm import ESWM, RandomWall ,OpenWorld
 
 class ESWMDynaQAgent:
     def __init__(self, num_states, num_actions, eswm_model, alpha=0.1, gamma=0.95, epsilon=0.1, n_planning=5,seed=123):
@@ -85,7 +85,7 @@ class ESWMDynaQAgent:
         
         with torch.no_grad():
             _, _, out_end = self.eswm(x)
-        predicted_end_state = torch.argmax(out_end,dim=1).cpu()
+        predicted_end_state = torch.argmax(out_end[:,:37],dim=1).cpu()
         return predicted_end_state
 
 def train_agent(episodes=100, n_planning=10, max_steps=100,s=123):
