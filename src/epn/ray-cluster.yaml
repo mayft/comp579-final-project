@@ -1,0 +1,60 @@
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: ray-impala-job
+  namespace: default
+spec:
+  entrypoint: python /app/epn.py
+  shutdownAfterJobFinishes: true
+  
+  rayClusterSpec:
+    rayVersion: '2.9.0'
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: '0.0.0.0'
+      template:
+        spec:
+          nodeSelector:
+            role: headnode
+          containers:
+            - name: ray-head
+              image: eswmregistry.azurecr.io/ray-impala-cu118:v1
+              env:
+                - name: AZURE_STORAGE_CONNECTION_STRING
+                  value: "DefaultEndpointsProtocol=https;EndpointSuffix=core.windows.net;AccountName=eswmraystorage;AccountKey=Q0yX6r8KEdtq+9ZbeYNn2d/sxTdyFM1Rr6G5AOCnRln8F0qTd6qAka9l0kYGhkj6x3yNN+K5S3OF+AStdWvJ2w==;BlobEndpoint=https://eswmraystorage.blob.core.windows.net/;FileEndpoint=https://eswmraystorage.file.core.windows.net/;QueueEndpoint=https://eswmraystorage.queue.core.windows.net/;TableEndpoint=https://eswmraystorage.table.core.windows.net/"
+                - name: TF_USE_LEGACY_KERAS 
+                  value: "1"
+              resources:
+                limits:
+                  nvidia.com/gpu: 2
+                  cpu: "12"  
+                  memory: "100Gi" 
+                requests:
+                  nvidia.com/gpu: 2
+                  cpu: "12"
+                  memory: "100Gi"
+    workerGroupSpecs:
+      - groupName: worker-group
+        replicas: 30 
+        minReplicas: 30
+        maxReplicas: 30
+        rayStartParams: {}
+        template:
+          spec:
+            nodeSelector:
+              role: worker 
+            containers:
+              - name: ray-worker
+                image: eswmregistry.azurecr.io/ray-impala-cu118:v1
+                env:
+                  - name: AZURE_STORAGE_CONNECTION_STRING
+                    value: "DefaultEndpointsProtocol=https;EndpointSuffix=core.windows.net;AccountName=eswmraystorage;AccountKey=Q0yX6r8KEdtq+9ZbeYNn2d/sxTdyFM1Rr6G5AOCnRln8F0qTd6qAka9l0kYGhkj6x3yNN+K5S3OF+AStdWvJ2w==;BlobEndpoint=https://eswmraystorage.blob.core.windows.net/;FileEndpoint=https://eswmraystorage.file.core.windows.net/;QueueEndpoint=https://eswmraystorage.queue.core.windows.net/;TableEndpoint=https://eswmraystorage.table.core.windows.net/"
+                  - name: TF_USE_LEGACY_KERAS
+                    value: "1"
+                resources:
+                  limits:
+                    cpu: "1"  
+                    memory: "2Gi"
+                  requests:
+                    cpu: "1"
+                    memory: "2Gi"

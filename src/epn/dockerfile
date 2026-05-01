@@ -1,0 +1,22 @@
+# Start from the official Ray image with GPU support
+FROM rayproject/ray:2.9.0-py39-cu118
+
+# Switch to root to install dependencies if needed, or stick to ray user
+USER ray
+
+# Install requested packages and environment dependencies
+RUN pip install --no-cache-dir \
+    tensorflow \
+    tf-keras \ 
+    mlflow \
+    gymnasium \
+    pygame \
+    azure-storage-blob \
+    fsspec
+
+# Set up the working directory
+WORKDIR /app
+
+# Copy the training script and environment module into the container
+COPY epn.py /app/epn.py
+COPY data_generation.py /app/data_generation.py
