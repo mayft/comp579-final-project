@@ -1,9 +1,11 @@
 import numpy as np
 import math
-import gymnasium as gym
-from gymnasium.core import ObsType, ActType, RenderFrame
-from gymnasium.spaces import Discrete, Graph
+#import gymnasium as gym
+#from gymnasium.core import ObsType, ActType, RenderFrame
+#from gymnasium.spaces import Discrete, Graph
 from enum import Enum
+import torch
+from joblib import Parallel, delayed
 
 '''
 hexgrid coordinate system
@@ -85,9 +87,10 @@ class Actions(Enum):
     W = 4
     NW = 5
 
-class Environment(gym.Env):
+class Environment():
     def __init__(self, side_length=3,add_wall=False,seed=123, hidden=0,possible_states=64,render=None,query_all=False):
         self.rng = np.random.default_rng(seed=seed)
+        self.seed = seed
         self.len = side_length
         self.hidden = hidden
         self.has_walls = add_wall
@@ -117,14 +120,14 @@ class Environment(gym.Env):
         self.clock=None
         self.size=2*side_length-1
         self._agent_location=side_length*100
-        self._target_location=(np.array([1,1]))
+        self._target_location=100
         self.step_limit = None
         self.step_count = 0
         self.reset()
 
         self.metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
-        self.action_space = Discrete(6)
-        self.observation_space = Discrete(self.num_states)
+        self.action_space =None#Discrete(6)
+        self.observation_space = None#Discrete(self.num_states)
 
     def make_grid(self):
         width = self.len
@@ -167,7 +170,7 @@ class Environment(gym.Env):
 
     def build_wall(self,test):
         start = self.rng.choice(self.locations)
-        self.wall = [start]
+        wall = [start]
         #direction 1, direction 2, length 1, length 2
         d = self.rng.integers(1,[6,3,6,4])
         d[1]  = (d[0]+2+self.rng.integers(3))%6
@@ -175,7 +178,7 @@ class Environment(gym.Env):
         for i in range(d[2]):
             s = self.states[s][d[0]]
             if s in self.locations:
-                self.wall.append(s)
+                wall.append(s)
             else:
                 break
         if test:
@@ -183,25 +186,36 @@ class Environment(gym.Env):
             for i in range(d[3]):
                 s = self.states[s][d[1]]
                 if s in self.locations:
-                    self.wall.append(s)
+                    wall.append(s)
                 else:
                     break
+        self.wall=wall
+        return wall
+
+    def set_wall(self,wall_locations):
+        self.wall = wall_locations
 
     def filter_observable(self,num_hidden):
-        self.obs_edges = self.edges.copy()
-        if num_hidden == 0: return
-        observable = list(filter(lambda x: x not in self.wall,self.locations))
+        obs_edges = self.edges.copy()
+        
+        if num_hidden == 0: return obs_edges,None
+        #observable = list(filter(lambda x: x not in self.wall,self.locations))
+        #observable = list(set(self.locations) - set(self.wall))
         num_hidden=self.rng.integers(num_hidden)+1
-        hidden_locations = self.rng.choice(observable,num_hidden,replace=False)
-        self.hidden_edges = []
-        ignore = []
-        for (a,b) in self.obs_edges:
-            if a in hidden_locations or b in hidden_locations:
-                self.hidden_edges.append((a,b))
-                if a in hidden_locations and b in hidden_locations:
-                    ignore.append((a,b))
-        self.obs_edges = list(filter(lambda x: x not in self.hidden_edges,self.obs_edges))
-        self.hidden_edges = list(filter(lambda x: x not in ignore, self.hidden_edges))
+        hidden_locations = self.rng.choice(self.locations,num_hidden,replace=False)
+        hidden_edges = [(a,b) for (a,b) in obs_edges if (a in hidden_locations)!= (b in hidden_locations)]
+        obs_edges = list(set(obs_edges) - set(hidden_edges))
+        self.obs_edges=obs_edges
+        self.hidden_edges = hidden_edges
+        return obs_edges,hidden_edges
+        #ignore = []
+        #for (a,b) in self.obs_edges:
+        #    if a in hidden_locations or b in hidden_locations:
+        #        self.hidden_edges.append((a,b))
+        #        if a in hidden_locations and b in hidden_locations:
+        #            ignore.append((a,b))
+        #self.obs_edges = list(filter(lambda x: x not in self.hidden_edges,self.obs_edges))
+        #self.hidden_edges = list(filter(lambda x: x not in ignore, self.hidden_edges))
 
     def get_transition(self,e):
 
@@ -243,12 +257,14 @@ class Environment(gym.Env):
             s= self.rng.permutation(self.test_states)
         else:
             s = self.rng.permutation(self.possible_states)
-        self.observations = dict(zip(self.locations, s))
+        observations = dict(zip(self.locations, s))
+        self.observations=observations
+        return observations
 
-    def mst(self):
+    def mst(self,obs_edges):
         V = self.num_states
-        weights = sorted(self.rng.random(len(self.obs_edges)))
-        edges = zip(weights,self.rng.permutation(self.obs_edges).tolist())
+        weights = sorted(self.rng.random(len(obs_edges)))
+        edges = zip(weights,self.rng.permutation(obs_edges).tolist())
         parent = list(range(V))
         rank = [1]*V
         cost = []
@@ -282,41 +298,41 @@ class Environment(gym.Env):
         return cost
 
     def new_environment(self,test_states=False):
-        self.filter_observable(self.hidden)
+        obs,hidden = self.filter_observable(self.hidden)
         if self.has_walls:
-            self.sample_env(test=False)
-            self.build_wall(test_states)
+            states= self.sample_env(test=False)
+            wall = self.build_wall(test_states)
         else:
-            self.sample_env(test_states)
+            states=self.sample_env(test_states)
+            wall=[]
+        return obs,hidden,states,wall
 
-    def generate_memory_bank(self):
-        paths = self.mst()
-        self.seen = paths
+    def generate_memory_bank(self,obs_edges,observations,wall):
+        paths = self.mst(obs_edges)
+        seen = paths
 
         trans = []
         for e in paths:
             t= self.get_transition(e)
 
-            if t[0] not in self.wall:
-                if t[2] in self.wall:
+            if t[0] not in wall:
+                if t[2] in wall:
                     t[2] = t[0]
-                trans.append(np.hstack([self.observations[t[0]], [t[1]], self.observations[t[2]]]))
+                trans.append(np.hstack([observations[t[0]], [t[1]], observations[t[2]]]))
 
-        self.unseen = list(set(self.obs_edges)-set(self.seen))
+        unseen = list(set(obs_edges)-set(seen))
         trans = self.rng.permutation(trans)
-        #trans = np.array(trans)[order]
-        #mask[i,:-1]= mask[i,:-1][order]
+        self.seen = seen
+        self.unseen= unseen
+        return trans,seen,unseen
 
-        #self.memory = trans
-        return trans
-
-    def get_query(self,transition_set):
-        if transition_set == 'unseen':
+    def get_query(self,transitions,observations):
+        '''if transition_set == 'unseen':
             transitions = self.unseen
         elif transition_set == 'seen':
             transitions = self.seen
         else:
-            transitions = self.hidden_edges
+            transitions = self.hidden_edges'''
         q = self.rng.choice(transitions, axis=0)
 
         while q[0] in self.wall and q[1] in self.wall:
@@ -330,18 +346,25 @@ class Environment(gym.Env):
         elif q[2] in self.wall:
             q[2] = q[0]
 
-        q = np.hstack([self.observations[q[0]], [q[1]], self.observations[q[2]]])
+        q = np.hstack([observations[q[0]], [q[1]], observations[q[2]]])
         return q
-
-    def sample_environments(self,n_samples,kind='unseen',test=False):
+            
+    def sample_environments(self,n_samples,kind='unseen',test=False,jobs=2):
         banks = []
         for i in range(n_samples):
-            self.new_environment(test)
-            bank = self.generate_memory_bank()
-            query = self.get_query(kind)
+            #banks = Parallel(n_jobs=jobs)(delayed(self.fn)(kind,test) for _ in range(n_samples))
+            obs,hidden,states,wall=self.new_environment(test)
+            bank,seen,unseen = self.generate_memory_bank(obs,states,wall)
+            if kind == 'unseen':
+                transitions =unseen
+            elif kind == 'seen':
+                transitions = seen
+            else:
+                transitions = hidden
+            query = self.get_query(transitions,states)
             bank = np.concatenate([bank, [query]], axis=0)
             banks.append(bank)
-        return banks
+        return (banks)
 
     def move(self,action):
         new_state = self.states[self._agent_location][action]
@@ -534,15 +557,22 @@ class Environment(gym.Env):
             )'''
 
     def _get_obs(self):
-        return {'agent':self._agent_location,'target':self._target_location}
+        return {'agent':self.observations[self._agent_location],'target':self.observations[self._target_location]}
 
-    def reset(self,seed=None,options=None):
-        super().reset(seed=seed)
+    def reset(self,seed=None,options=None,new_env=True):
+        #super().reset(seed=seed)
         self.step_count=0
-        self.new_environment()
+        if new_env:
+            self.new_environment()
+
         # when implementing ensure states are different and allowed
         self._agent_location = self.rng.choice(self.locations)
-        self._target_location = self.rng.choice(self.locations)
+        while self._agent_location in self.wall or self._target_location == self._agent_location:
+            self._agent_location = self.rng.choice(self.locations)
+        if new_env:
+            self._target_location = self.rng.choice(self.locations)
+            while self._target_location in self.wall or self._target_location == self._agent_location:
+                self._target_location = self.rng.choice(self.locations)
         observation = self._get_obs()
         info = None
 

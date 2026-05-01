@@ -55,7 +55,7 @@ class ESWM(nn.Module):
         self.action = nn.Linear(input_dim, num_actions)
         self.end = nn.Linear(input_dim, state_dim)
 
-    def forward(self, x,padding_mask,transition_mask=None):
+    def forward(self, x,padding_mask=None,transition_mask=None):
         src = self.embedding(x,transition_mask)
         src = self.model(src,src_key_padding_mask=padding_mask)
         query = src[:,-1]
@@ -88,6 +88,7 @@ def get_batch(environment, batch_size,state_bins=True,test=False,device='cpu',ki
         mask = torch.concat([q_mask[:, 0:1].repeat([1, 6]), q_mask[:, 1:2], q_mask[:, 2:].repeat([1, 6])], dim=-1)
         x = torch.concat([source,action,end],dim=-1).long()
         y = [source[:, -1], action[:,-1,0],end[:,-1]] 
+        padding_mask=None
     else:
         x=x.clone().long()
         mask=q_mask
@@ -163,7 +164,7 @@ def train(environment,model_type,batch_size=128,device='cpu',epochs=10,num_layer
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=460000)
 
     if pretrained:
-        checkpoint = torch.load(f'{filename}.pth')
+        checkpoint = torch.load(f'{filename}.pth',weights_only=True)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -194,7 +195,9 @@ def train(environment,model_type,batch_size=128,device='cpu',epochs=10,num_layer
 
         optimizer.zero_grad()
         output = model(src,padding_mask)
-        losses = [loss_s(output[0],target[0]),loss_a(output[1],target[1]),loss_s(output[2],target[2])]
+        loss1= torch.stack([loss_s(output[0][:,i],target[0][:,i]) for i in range(6)]).sum()
+        loss2 = torch.stack([loss_s(output[2][:,i],target[2][:,i]) for i in range(6)]).sum()
+        losses = [loss1,loss_a(output[1],target[1]),loss2]
         loss = torch.stack(losses).sum()
         loss.backward()
         optimizer.step()
@@ -214,11 +217,14 @@ def train(environment,model_type,batch_size=128,device='cpu',epochs=10,num_layer
                 #m = [mask_t[:,0:1].repeat(1,6),mask_t[:,1:2].repeat(1,6),mask_t[:,2:].repeat(1,6)]
                 #p = [torch.masked_select(out[i], m[i].ne(0)).view(-1,6) for i in range(3)]
                 #t = [torch.masked_select(y_t[i], m[i][:,:y_t[i].shape[1]]).view(-1,y_t[i].shape[1]) for i in range(3)]
-                losses_t = [loss_s(out[0],y_t[0]),loss_a(out[1],y_t[1]),loss_s(out[2],y_t[2])]
+                loss1= torch.stack([loss_s(out[0][:,i],y_t[0][:,i]) for i in range(6)]).sum()
+                loss2 = torch.stack([loss_s(out[2][:,i],y_t[2][:,i]) for i in range(6)]).sum()
+                losses_t = [loss1,loss_a(out[1],y_t[1]),loss2]
                 loss_t = torch.stack(losses_t).sum()
                 #test_acc = accuracy(p,t)
                 outputs = (epoch,loss,*losses,loss_t,*losses_t,*train_acc,*test_acc)
                 file.write(out_format % outputs)
+                file.flush()
 
             if epoch % 1000==0 or epoch+1==epochs:
                 checkpoint = {
@@ -235,8 +241,8 @@ def train(environment,model_type,batch_size=128,device='cpu',epochs=10,num_layer
 
 if __name__ == "__main__":
     open_env = Environment()
-    wall_env = Environment(side_length=4,add_wall=True,hidden=5,possible_states=37,query_all=True)
+    #wall_env = Environment(side_length=4,add_wall=True,hidden=5,possible_states=37,query_all=True)
     #mod = train(env,epochs=200,filename='tester0',num_layers=6,device='mps')
     #env = Environment(side_length=4,add_wall=True,hidden=5,possible_states=37,query_all=True)
-    train(open_env,epochs=4000,filename='src/tests/open',num_layers=6,device='mps',model_type='open_arena',pretrained=True)
+    train(open_env,epochs=4000,filename='src/tests/open3',num_layers=10,device='mps',model_type='open_arena',pretrained=False)
     #train(wall_env,epochs=2000,filename='src/tests/wall',num_layers=2,device='mps',model_type='random_wall')
