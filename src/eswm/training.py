@@ -8,9 +8,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import GradScaler, autocast
 
-# from models.eswm import ESWM_T
-# from models.epn import EPN
-# from envs.hex_grid import generate_hex_grid_batch
+# from models.eswm import ESWM
 
 def setup():
     # Change 'nccl' to 'gloo' for local testing
@@ -50,7 +48,6 @@ def train(args):
         logger.info(f"Starting distributed training job on {world_size} nodes.")
         mlflow.start_run()
 
-    # model = ESWM_T(arguments).to(device)
     model = torch.nn.Linear(10, 10).to(device) 
     
     # Dynamic Learning Rate Scaling
@@ -65,7 +62,6 @@ def train(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=scaled_lr)
     scaler = GradScaler() 
 
-    # Checkpointing Setup
     checkpoint_dir = args.checkpoint_dir 
     checkpoint_path = os.path.join(checkpoint_dir, "latest_checkpoint.pt")
     
@@ -89,7 +85,6 @@ def train(args):
         logger.info("No checkpoint found. Starting weights from scratch.")
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Wrap the model in DDP *after* loading any base model weights
     ddp_model = DDP(model, device_ids=[local_rank])
 
     # Training Loop

@@ -119,7 +119,6 @@ class ESWMDynaQAgent:
             q_sim_next = self.get_q(sim_s_prime, target_loc)
             sim_td_target = sim_reward + self.gamma * np.max(q_sim_next)
             
-            # Update goal-conditioned Q-value
             self.get_q(sim_s, target_loc)[sim_a] += self.alpha * (sim_td_target - self.get_q(sim_s, target_loc)[sim_a])
 
     def _query_eswm(self, start_state, action, device):

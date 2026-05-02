@@ -18,7 +18,7 @@ spec:
             role: headnode
           containers:
             - name: ray-head
-              image: eswmregistry.azurecr.io/ray-impala-cu118:v1
+              image:
               env:
                 - name: AZURE_STORAGE_CONNECTION_STRING
                   value:
@@ -45,7 +45,7 @@ spec:
               role: worker 
             containers:
               - name: ray-worker
-                image: eswmregistry.azurecr.io/ray-impala-cu118:v1
+                image:
                 env:
                   - name: AZURE_STORAGE_CONNECTION_STRING
                     value: 
