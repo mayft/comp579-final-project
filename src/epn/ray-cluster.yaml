@@ -21,7 +21,7 @@ spec:
               image: eswmregistry.azurecr.io/ray-impala-cu118:v1
               env:
                 - name: AZURE_STORAGE_CONNECTION_STRING
-                  value: "DefaultEndpointsProtocol=https;EndpointSuffix=core.windows.net;AccountName=eswmraystorage;AccountKey=Q0yX6r8KEdtq+9ZbeYNn2d/sxTdyFM1Rr6G5AOCnRln8F0qTd6qAka9l0kYGhkj6x3yNN+K5S3OF+AStdWvJ2w==;BlobEndpoint=https://eswmraystorage.blob.core.windows.net/;FileEndpoint=https://eswmraystorage.file.core.windows.net/;QueueEndpoint=https://eswmraystorage.queue.core.windows.net/;TableEndpoint=https://eswmraystorage.table.core.windows.net/"
+                  value:
                 - name: TF_USE_LEGACY_KERAS 
                   value: "1"
               resources:
@@ -48,7 +48,7 @@ spec:
                 image: eswmregistry.azurecr.io/ray-impala-cu118:v1
                 env:
                   - name: AZURE_STORAGE_CONNECTION_STRING
-                    value: "DefaultEndpointsProtocol=https;EndpointSuffix=core.windows.net;AccountName=eswmraystorage;AccountKey=Q0yX6r8KEdtq+9ZbeYNn2d/sxTdyFM1Rr6G5AOCnRln8F0qTd6qAka9l0kYGhkj6x3yNN+K5S3OF+AStdWvJ2w==;BlobEndpoint=https://eswmraystorage.blob.core.windows.net/;FileEndpoint=https://eswmraystorage.file.core.windows.net/;QueueEndpoint=https://eswmraystorage.queue.core.windows.net/;TableEndpoint=https://eswmraystorage.table.core.windows.net/"
+                    value: 
                   - name: TF_USE_LEGACY_KERAS
                     value: "1"
                 resources:

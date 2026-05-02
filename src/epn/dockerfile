@@ -1,10 +1,8 @@
-# Start from the official Ray image with GPU support
+
 FROM rayproject/ray:2.9.0-py39-cu118
 
-# Switch to root to install dependencies if needed, or stick to ray user
 USER ray
 
-# Install requested packages and environment dependencies
 RUN pip install --no-cache-dir \
     tensorflow \
     tf-keras \ 

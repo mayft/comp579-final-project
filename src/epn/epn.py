@@ -233,7 +233,6 @@ if __name__ == "__main__":
         )
     )
 
-    AZURE_URI = "az://ray-checkpoints/epn-massive-run"
 
     tune.run(
         "IMPALA",
@@ -246,7 +245,6 @@ if __name__ == "__main__":
         checkpoint_freq=100,     # Saves every ~1.2M steps
         checkpoint_at_end=True,  # Ensures the very final step is saved
         
-        storage_path=AZURE_URI, 
         
         sync_config=SyncConfig(
             sync_period=300,
@@ -254,6 +252,6 @@ if __name__ == "__main__":
         ),
         
         callbacks=[
-            MLflowLoggerCallback(experiment_name="epn-massive-azure")
+            MLflowLoggerCallback()
         ]
     )
