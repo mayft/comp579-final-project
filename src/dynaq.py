@@ -4,21 +4,26 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 from tqdm import tqdm
+from torchrl.data import ReplayBuffer
+from collections import deque
+import json
 
 # Import the environment and models from your provided scripts
 from data_generation import Environment 
 from eswm.eswm import ESWM, RandomWall ,OpenWorld
 
 class ESWMDynaQAgent:
-    def __init__(self, num_states, num_actions, eswm_model, alpha=0.1, gamma=0.95, epsilon=0.1, n_planning=5,seed=123):
+    def __init__(self, num_states, num_actions, eswm_model, alpha=0.1, gamma=0.99, epsilon=0.1,memory_cap=120,bank=None, n_planning=5,seed=123):
         self.Q = np.zeros((num_states, num_actions))
         self.alpha = alpha
         self.gamma = gamma
         self.epsilon = epsilon
         self.n = n_planning
         self.eswm = eswm_model
-        
+        self.bank = None#torch.tensor(bank,dtype=torch.long)
         self.memory_bank = []
+        #self.memory_buf = ReplayBuffer()
+        self.memory_buf= deque(maxlen=memory_cap)
         self.observed_states = []
         self.observed_actions = {}
         self.rng = np.random.default_rng(seed=seed)
@@ -28,7 +33,7 @@ class ESWMDynaQAgent:
             return self.rng.choice(self.Q.shape[1])
         return np.argmax(self.Q[state])
         
-    def step(self, state, action, reward, next_state, target_loc, device='cpu'):
+    def step(self, state, action, reward, next_state, target_loc,step, device='cpu'):
         
         best_next_a = np.argmax(self.Q[next_state])
         td_target = reward + self.gamma * self.Q[next_state][best_next_a]
@@ -36,6 +41,8 @@ class ESWMDynaQAgent:
         
         transition = ([state, action, next_state])
         if transition not in self.memory_bank:
+            self.bank = torch.cat([self.bank,torch.tensor([transition],dtype=torch.long)]) if self.bank is not None else torch.tensor([transition],dtype=torch.long)
+            self.memory_buf.append(torch.tensor(transition,dtype=torch.long,device=device))
             self.memory_bank.append(transition)
             if state not in self.observed_states:
                 self.observed_states.append(state)
@@ -43,41 +50,37 @@ class ESWMDynaQAgent:
             if action not in self.observed_actions[state]:
                 self.observed_actions[state].append(action)
                 
-        if len(self.observed_states) > 0 and self.n > 0:
-            self._plan(target_loc, device)
+        if len(self.observed_states) > 0 and self.n > 0:# and step%10==0:
+            self._plan(target_loc, next_state, device)
             
-    def _plan(self, target_loc, device):
+    def _plan(self, target_loc,agent_loc, device):
         """Hallucinates experience by querying the ESWM."""
         self.eswm.eval()
-        '''for _ in range(self.n):
-            sim_s = self.rng.choice(self.observed_states)
-            sim_a = self.rng.choice(self.observed_actions[sim_s])
-            sim_s_prime = self._query_eswm(sim_s, sim_a, device)
-            
-            sim_reward = 1 if sim_s_prime == target_loc else -0.01
-            
+        '''for action in range(6):
+            sim_s_prime = self._query_eswm([agent_loc],[action],device)
+            sim_reward = 0.5 if sim_s_prime==target_loc else -0.01
             best_sim_next_a = np.argmax(self.Q[sim_s_prime])
             sim_td_target = sim_reward + self.gamma * self.Q[sim_s_prime][best_sim_next_a]
-            self.Q[sim_s, sim_a] += self.alpha * (sim_td_target - self.Q[sim_s, sim_a])'''
+            self.Q[agent_loc, action] += self.alpha * (sim_td_target - self.Q[agent_loc,action])'''
 
-        sim_s = self.rng.choice(self.observed_states,size=n)
+        sim_s = self.rng.choice(self.observed_states,size=self.n)
         sim_a = [self.rng.choice(self.observed_actions[s]) for s in sim_s]
         sim_s_prime = self._query_eswm(sim_s,sim_a,device)
-        sim_reward = np.where(sim_s_prime==target_loc,1,-0.1)
+        sim_reward = np.where(sim_s_prime==target_loc,0.5,0)
+
         for i in range(self.n):
             best_sim_next_a = np.argmax(self.Q[sim_s_prime[i]])
             sim_td_target = sim_reward[i] + self.gamma * self.Q[sim_s_prime[i]][best_sim_next_a]
             self.Q[sim_s[i], sim_a[i]] += self.alpha * (sim_td_target - self.Q[sim_s[i], sim_a[i]])
 
-        
-
-
     def _query_eswm(self, start_state, action, device):
         """Formats the memory bank and query for the PyTorch ESWM model."""
-        m =torch.tensor(self.memory_bank,dtype=torch.long,device=device)
+        #m =torch.tensor(self.memory_bank,dtype=torch.long,device=device)
+        m = self.bank.to(device)#torch.stack(list(self.memory_buf))
         query = torch.tensor(np.column_stack([start_state, action, [-1]*len(action)]),dtype=torch.long,device=device).unsqueeze(1)
+        #m =torch.stack([self.memory_buf for _ in range(query.shape[0])])
+        #x = torch.cat([m,query],dim=1)
         x = torch.cat([m.repeat([query.shape[0],1,1]),query],dim=1)   
-    
         #seq = self.memory_bank + [query]
         #x = torch.tensor([seq], dtype=torch.long, device=device)
         
@@ -85,27 +88,26 @@ class ESWMDynaQAgent:
         
         with torch.no_grad():
             _, _, out_end = self.eswm(x)
+
         predicted_end_state = torch.argmax(out_end[:,:37],dim=1).cpu()
         return predicted_end_state
+
 
 def train_agent(episodes=100, n_planning=10, max_steps=100,s=123):
     device = 'mps' if torch.mps.is_available() else 'cpu'
     env = Environment(side_length=4, add_wall=True, hidden=0, possible_states=37, query_all=True,seed=s)
-    env.set_wall([3,103,203,303,402,401])
-    #env = Environment()
+    env.set_wall([3,103,203,303,402,401]) 
     eswm_params = {'embedder': RandomWall(), 'input_dim': 1024, 'state_dim': 38, 'num_actions': 7,}
-    #eswm_params = {'embedder': OpenWorld()}
     eswm_model = ESWM(num_layers=10, **eswm_params).to(device)
     model_weights= torch.load('tests/ESWM-T10-R-159999.pth',weights_only=True,map_location=device)
     eswm_model.load_state_dict(model_weights['model_state_dict'])
     eswm_model.to(device)
+    bank,_,_ = env.generate_memory_bank(obs_edges=env.obs_edges,observations=env.observations,wall=env.wall)
+    agent = ESWMDynaQAgent(num_states=env.num_states, num_actions=6, eswm_model=eswm_model, n_planning=n_planning,bank=bank,seed=s)
     
-    agent = ESWMDynaQAgent(num_states=env.num_states, num_actions=6, eswm_model=eswm_model, n_planning=n_planning,seed=s)
     steps_per_episode = []
     reward_per_episode = []
-
     for ep in tqdm(range(episodes)):
-
         obs, _ = env.reset(new_env=False)
         env._target_location=102
         env._agent_location=206
@@ -122,13 +124,14 @@ def train_agent(episodes=100, n_planning=10, max_steps=100,s=123):
             next_state = next_obs['agent']
             done = terminated or truncated
             
-            agent.step(state, action, reward, next_state, target_loc, device)
+            agent.step(state, action, reward, next_state, target_loc,steps, device)
             state = next_state
             steps += 1
         reward_per_episode.append(total_reward)    
         steps_per_episode.append(steps)
         if ep % 10 == 0:
-            print(f"Episode {ep}/{episodes} - Steps to goal: {steps}, reward: {total_reward} {obs['agent']}->{obs['target']}")    
+            #print(f"Episode {ep}/{episodes} - Steps to goal: {}, reward: {total_reward} {obs['agent']}->{obs['target']}")
+            print(steps_per_episode[-10:])    
     '''plt.figure(figsize=(12, 6))
     plt.plot(steps_per_episode, label=f'ESWM-Dyna-Q (n={n_planning})', color='#4A90E2', linewidth=2)
     plt.xlabel('Episodes', fontsize=12)
@@ -138,7 +141,8 @@ def train_agent(episodes=100, n_planning=10, max_steps=100,s=123):
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.tight_layout()
     plt.show()'''
-    return steps_per_episode
+    #print(agent.Q)
+    return steps_per_episode, agent.Q
 
 if __name__ == "__main__":
     steps=pd.DataFrame()
@@ -147,11 +151,20 @@ if __name__ == "__main__":
     #steps.append(train_agent(episodes=100, n_planning=5,max_steps=200,s=123))
     #sns.lineplot(steps)
     #plt.savefig('dyna.png',bbox_inches='tight',dpi=500)
-    for n in [1]:
+    values_fns = {}
+    for n in [0,1]:
         for i in range(1):
-            steps[f'{123+i}',n]=(train_agent(episodes=100, n_planning=n,max_steps=200,s=123+i))
+            steps[f'{123+i}',n], q=train_agent(episodes=60, n_planning=n,max_steps=40,s=123+i)
+            values_fns[f'{123+i}_{n}']=q
     steps = steps.melt(var_name='vars',value_name='steps',ignore_index=False)
     steps['seed'],steps['n'] = zip(*steps['vars'])
-    #steps.to_csv('dynaq_data')
-    sns.lineplot(steps,y='steps',x=steps.index,hue='n')
-    #plt.savefig('dyna.png',bbox_inches='tight',dpi=500)
+    file = open('value5.txt',mode='w')
+    for k,v in values_fns.items():
+        file.write(f'\n{k}\n')
+        file.write(f'{v}')
+    file.close()
+    steps.to_csv('dyna_q_data5.csv')#,mode='a', index=False, header=False)
+    
+    sns.lineplot(steps,y='steps',x=steps.index,hue='n',errorbar=None)
+    plt.savefig('dyna5.png',bbox_inches='tight',dpi=500)
+    plt.show()

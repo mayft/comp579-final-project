@@ -116,9 +116,9 @@ class Environment():
         self.make_grid()
 
         self.window=None
-        self.window_size=500
+        self.window_size=600
         self.clock=None
-        self.size=2*side_length-1
+        self.size=(2*side_length-1)*1.6
         self._agent_location=side_length*100
         self._target_location=100
         self.step_limit = None
@@ -196,9 +196,9 @@ class Environment():
         self.wall = wall_locations
 
     def filter_observable(self,num_hidden):
-        obs_edges = self.edges.copy()
+        self.obs_edges = self.edges.copy()
         
-        if num_hidden == 0: return obs_edges,None
+        if num_hidden == 0: return self.obs_edges,None
         #observable = list(filter(lambda x: x not in self.wall,self.locations))
         #observable = list(set(self.locations) - set(self.wall))
         num_hidden=self.rng.integers(num_hidden)+1
@@ -305,6 +305,7 @@ class Environment():
         else:
             states=self.sample_env(test_states)
             wall=[]
+        self.wall = wall
         return obs,hidden,states,wall
 
     def generate_memory_bank(self,obs_edges,observations,wall):
@@ -409,13 +410,34 @@ class Environment():
                             query = self.get_query('unseen')
                             print(query)
 
-    def coords(self,state):
+    def coords(self,state,hexes=False):
         coords= np.array([state//100,state%100],dtype=float)
         if coords[1]%2 and self.len%2:
             coords[0]+=0.5
         elif not coords[1]%2 and not self.len%2:
             coords[0]-=0.5
+
+        coords[1]*=1.5
+        coords[0]*=1.5
+        if not hexes:
+            coords+=1
+            coords[0]+=0.25
+            return coords
         return coords+0.5
+    
+    def hex_points(self, state,side_len):
+        x,y= self.coords(state,True)*side_len
+        x-=0.5
+        y-=0.5
+        width= side_len*1.5
+        points = [(x,y),
+                  (x+width/2,y-side_len/2),
+                  (x+width,y),
+                  (x+width,y+side_len),
+                  (x+width/2,y+1.5*side_len),
+                  (x,y+side_len),
+                  ]
+        return points
 
     def _render_frame(self,query):
         import pygame
@@ -445,26 +467,32 @@ class Environment():
 
                 color[1]-=20
 
-            pygame.draw.rect(
+            '''pygame.draw.rect(
                 canvas,
                 color,
                 pygame.Rect(
                     square * pix_square_size,
                     (pix_square_size, pix_square_size),
-                ),
+                ),)'''
+            pygame.draw.polygon(
+                canvas,
+                color,
+                points=self.hex_points(loc,pix_square_size)
             )
+            
 
         for state in self.wall:
-            pygame.draw.rect(
+            pygame.draw.polygon(
                 canvas,
                 (50,50,50),
-                pygame.Rect(
-                    (self.coords(state)-0.5) * pix_square_size,
-                    (pix_square_size, pix_square_size),
-                ),
+                points=self.hex_points(state,pix_square_size)
             )
-
-        for s, edges in self.states.items():
+        pygame.draw.polygon(
+                canvas,
+                (200,0,0),
+                points=self.hex_points(self._target_location,pix_square_size)
+            )
+        '''for s, edges in self.states.items():
             start = self.coords(s)*pix_square_size
             for e in edges:
                 if e:#(s,e) in self.seen or (e,s) in self.seen:
@@ -475,7 +503,7 @@ class Environment():
                         start,
                         end,
                         width=3,
-                    )
+                    )'''
 
         for (s1,s2) in self.seen:
             if s1 not in self.wall or s2 not in self.wall:
@@ -491,7 +519,7 @@ class Environment():
                     self.coords(b)*pix_square_size,
                     width=3,
                 )
-        for (s1,s2) in self.unseen:
+        '''for (s1,s2) in self.unseen:
             if s1 not in self.wall or s2 not in self.wall:
                 a = s1#next((k for k, v in self.observations.items() if v == s1), None)
                 b = s2#next((k for k, v in self.observations.items() if v == s2), None)
@@ -502,7 +530,7 @@ class Environment():
                     self.coords(a)*pix_square_size,
                     self.coords(b)*pix_square_size,
                     width=3,
-                )
+                )'''
         for (s1,s2) in self.hidden_edges:
             if s1 not in self.wall or s2 not in self.wall:
                 a = s1#next((k for k, v in self.observations.items() if v == s1), None)
@@ -515,6 +543,24 @@ class Environment():
                     self.coords(b)*pix_square_size,
                     width=3,
                 )
+        for (a,b) in [(205,305)]:
+            color=(200,0,0)
+            pygame.draw.line(
+                canvas,
+                color,
+                self.coords(a)*pix_square_size,
+                self.coords(b)*pix_square_size,
+                width=3,
+            )
+        for (a,b) in [(206,205)]:
+            color=(0,0,200)
+            pygame.draw.line(
+                canvas,
+                color,
+                self.coords(a)*pix_square_size,
+                self.coords(b)*pix_square_size,
+                width=3,
+            )
         
         if query is not None:
             a = next((k for k, v in self.observations.items() if v == query[0]), None)
@@ -528,11 +574,13 @@ class Environment():
                 width=3,
             )
         # Now we draw the agent
+        c=(self.coords(self._agent_location)+0.5)
+        c[0]+=0.25
         pygame.draw.circle(
             canvas,
             (100, 0, 50),
             self.coords(self._agent_location) * pix_square_size,
-            pix_square_size / 3,
+            pix_square_size *0.6,
         )
 
         running = True
@@ -589,11 +637,15 @@ class Environment():
         return observation,reward,terminated,truncated,info
 
 if __name__ == '__main__':
-    env = Environment(side_length=4,render='human',add_wall=True,hidden=5,possible_states=37,query_all=True)
+    env = Environment(side_length=4,render='human',add_wall=True,hidden=0,possible_states=37,query_all=True,seed=1)
+
     #env = Environment(side_length=4,possible_states=37,render='human')
     #env = Environment(render='human')
-    env.reset()
-    env.generate_memory_bank()
+    #env.reset()
+    env.wall = [3,103,203,303,402]
+    env._target_location =102
+    env._agent_location = 206 
+    #env.generate_memory_bank(env.obs_edges,env.observations,env.wall)
     env.render()
 
 
