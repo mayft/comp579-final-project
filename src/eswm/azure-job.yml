@@ -1,4 +1,4 @@
-$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+$schema:
 type: command
 description: Distributed Training for ESWM and Dyna-Q
 experiment_name: eswm-distributed-replication
@@ -17,7 +17,7 @@ outputs:
   cloud_checkpoint_dir:
     type: uri_folder
     # This points to your permanent Workspace Blob Storage
-    path: azureml://datastores/workspaceblobstore/paths/eswm_project/checkpoints
+    path:
     # rw_mount means "Read/Write Mount". It acts like a live USB drive.
     mode: rw_mount
 

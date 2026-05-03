@@ -14,114 +14,112 @@ from tensorflow import keras
 from tensorflow.keras.layers import Dense, ReLU, MultiHeadAttention, LayerNormalization
 from tensorflow.keras import Model, Sequential, layers
 
+from data_generation import Environment
+
 import gymnasium as gym
 from gymnasium.spaces import Discrete, Box
 import numpy as np
 import random
 from data_generation import Environment
+from google.colab import drive
+drive.mount('')
+
+CHECKPOINT_PATH = "" # Set to blank for security
+os.makedirs(CHECKPOINT_PATH, exist_ok=True)
+
 
 class ESWMGymEnv(gym.Env):
     def __init__(self, env_config=None):
         self.env = Environment(side_length=4, add_wall=True, hidden=5, possible_states=37)
         self.action_space = Discrete(6)
-        
+
         self.max_steps = 200
         self.current_step = 0
-        
-        self.seq_length = len(self.env.locations) + 1 
-        # 3 dimensions: (source_index, action_index, end_index)
+
+        self.seq_length = 201
         self.observation_space = Box(low=0, high=40, shape=(self.seq_length, 3), dtype=np.float32)
 
     def _get_obs(self):
         """Formats the memory bank and the current goal into the 3-dim structure."""
         obs = np.zeros((self.seq_length, 3), dtype=np.float32)
-        
+
         # Fill the memory bank transitions
         for i, (s1_val, action, s2_val) in enumerate(self.env.bank):
             if i >= self.seq_length - 1:
                 break
-            
-            # NOTE: Adding +1 to states so '0' is strictly used for padding masking!
+
             obs[i, 0] = s1_val + 1
-            obs[i, 1] = action + 1 
+            obs[i, 1] = action + 1  
             obs[i, 2] = s2_val + 1
-                
+
         current_loc = self.env._agent_location
         target_loc = self.env._target_location
-        
-        # Append the target condition using observations
+
         obs[-1, 0] = self.env.observations[current_loc] + 1
-        obs[-1, 1] = 7 # Dummy action (Ensure this matches padding expectations)
+        obs[-1, 1] = 7
         obs[-1, 2] = self.env.observations[target_loc] + 1
-        
+
         return obs
 
     def reset(self, *, seed=None, options=None):
-        super().reset(seed=seed)
-        self.current_step = 0
-        
-        self.env.reset(seed=seed)
-        
-        self.env.bank = self.env.generate_memory_bank()
-        
-        # Pick a random start and target location that are NOT in the wall
-        valid_locations = [loc for loc in self.env.locations if loc not in self.env.wall]
-        
-        if len(valid_locations) >= 2:
-            self.env._agent_location, self.env._target_location = random.sample(valid_locations, 2)
-        else:
-            self.env._agent_location = self.env.locations[0]
-            self.env._target_location = self.env.locations[-1]
-        
-        return self._get_obs(), {}
+      super().reset(seed=seed)
+      self.current_step = 0
+      self.env.reset(seed=seed)
+
+      mst_bank = self.env.generate_memory_bank().tolist()
+
+      while len(mst_bank) < 200:
+          extra_edge = random.choice(self.env.obs_edges)
+          t = self.env.get_transition(extra_edge)
+          if t[0] not in self.env.wall and t[2] not in self.env.wall:
+              formatted_t = np.hstack([self.env.observations[t[0]], [t[1]], self.env.observations[t[2]]])
+              mst_bank.append(formatted_t)
+
+      self.env.bank = mst_bank
+
+      valid_locations = [loc for loc in self.env.locations if loc not in self.env.wall]
+      self.env._agent_location, self.env._target_location = random.sample(valid_locations, 2)
+      return self._get_obs(), {}
 
     def step(self, action):
-        self.current_step += 1
+      self.current_step += 1
+      self.env.move(action)
+      obs = self._get_obs()
 
-        # While manual moving works, you can also just use the base env's move logic:
-        self.env.move(action)
-            
-        obs = self._get_obs()
-        
-        if self.env._agent_location == self.env._target_location:
-            reward = 1.0
-            terminated = True
-        else:
-            reward = -0.01
-            terminated = False
-            
-        truncated = False
-        if self.current_step >= self.max_steps:
-            truncated = True
-            
-        info = {
-            "success": terminated,
-            "path_length": self.current_step
-        }
-            
-        return obs, reward, terminated, truncated, info
-    
+      curr_coords = self.env.coords(self.env._agent_location)
+      target_coords = self.env.coords(self.env._target_location)
+      dist = np.linalg.norm(curr_coords - target_coords)
+
+      if self.env._agent_location == self.env._target_location:
+          reward = 10.0 
+          terminated = True
+      else:
+          reward = -0.01 - (dist * 0.01)
+          terminated = False
+
+      truncated = self.current_step >= self.max_steps
+      info = {"success": terminated, "dist": dist}
+      return obs, reward, terminated, truncated, info
+
 def env_creator(env_config):
     return ESWMGymEnv(env_config)
 
 class RandomWall(Model):
     def __init__(self):
         super().__init__()
-        # Embedding sizes matched to PyTorch RandomWall (39, 8, 39 to 1024)
-        self.source_embed = layers.Embedding(39, 1024, mask_zero=True)
-        self.action_embed = layers.Embedding(8, 1024, mask_zero=True)
-        self.end_embed = layers.Embedding(39, 1024, mask_zero=True)
+        self.source_embed = layers.Embedding(39, 256, mask_zero=True)
+        self.action_embed = layers.Embedding(8, 256, mask_zero=True)
+        self.end_embed = layers.Embedding(39, 256, mask_zero=True)
 
     def call(self, x):
-        # Cast observations to integer indices
         x = tf.cast(x, tf.int32)
-        
+
         start = self.source_embed(x[:, :, 0])
         action = self.action_embed(x[:, :, 1])
         end = self.end_embed(x[:, :, 2])
-        
+
         return tf.reduce_mean(tf.stack([start, action, end], axis=0), axis=0)
-    
+
 class EPN(Model):
     def __init__(self, sa_iterations, input_dim, num_outputs):
         super().__init__()
@@ -132,54 +130,48 @@ class EPN(Model):
 
         self.add_state = layers.Concatenate(axis=1)
         self.planner = Sequential([
-            ReLU(),
-            Dense(64),
-            Dense(64),
+            Dense(input_dim, activation="relu"),
             Dense(input_dim)
         ])
 
         self.pool = layers.Maximum()
         self.policy_net = Sequential([
-            Dense(64), Dense(64), ReLU()
+            Dense(64, activation="relu"), Dense(64, activation="relu")
         ])
 
-        self.logits = Dense(num_outputs) 
-        self.baseline = Dense(1) 
+        self.logits = Dense(num_outputs)
+        self.baseline = Dense(1)
 
     def call(self, x, state):
-        b = []
-        for i in range(self.attention_iterations):
-            att = self.norm(x)
-            att = self.mha(att, att)
-            x = self.add([x, att])
-            
-            xc = self.add_state([x, state])
-            
-            xc = self.planner(xc)
-            
-            x = xc[:, :-1, :]
-            state = xc[:, -1:, :]
-            
-            b.append(xc)
+      b = []
+      for i in range(self.attention_iterations):
+          combined = self.add_state([x, state])
 
-        x = self.pool(b)
-        
-        x = tf.reduce_max(x, axis=1)
-        
-        x = self.policy_net(x)
-        logits = self.logits(x)
-        baseline = self.baseline(x)
-        return logits, baseline
+          att = self.norm(combined)
+          att = self.mha(att, att)
+          combined = self.add([combined, att])
+
+          xc = self.planner(combined)
+
+          x = xc[:, :-1, :]
+          state = xc[:, -1:, :]
+          b.append(xc)
+
+      x = self.pool(b)
+      x = tf.reduce_max(x, axis=1)
+
+      x = self.policy_net(x)
+      return self.logits(x), self.baseline(x)
 
 
 class RLlibEPNModel(TFModelV2):
     def __init__(self, obs_space, action_space, num_outputs, model_config, name):
         super().__init__(obs_space, action_space, num_outputs, model_config, name)
-        
+
         sa_iters = model_config.get("custom_model_config", {}).get("sa_iterations", 6)
         input_dim = model_config.get("custom_model_config", {}).get("input_dim", 1024)
         self.embed = RandomWall()
-        
+
         self.epn = EPN(sa_iters, input_dim, num_outputs)
         self._value_out = None
 
@@ -210,50 +202,44 @@ if __name__ == "__main__":
             enable_rl_module_and_learner=False,
             enable_env_runner_and_connector_v2=False
         )
-        .environment("eswm_env") 
-        .framework("tf2", eager_tracing=True) 
+        .environment("eswm_env")
+        .framework("tf2", eager_tracing=True)
         .resources(
-            num_gpus=2,             
-            num_cpus_per_worker=1 
+            num_gpus=1
         )
         .env_runners(
-            num_env_runners=30,  
-            rollout_fragment_length=200 
+            num_env_runners=10,
+            num_cpus_per_env_runner=1,
+            num_envs_per_env_runner=4,
+            rollout_fragment_length=400
         )
         .training(
-            train_batch_size=12000,
+            train_batch_size=4000,
             lr=0.0001,
+            entropy_coeff=0.01,
             model={
                 "custom_model": "epn_rllib_model",
                 "custom_model_config": {
-                    "sa_iterations": 4, 
-                    "input_dim": 1024
+                    "sa_iterations": 4,
+                    "input_dim": 256
                 }
             }
         )
     )
 
-    AZURE_URI = "az://ray-checkpoints/epn-massive-run"
-
     tune.run(
         "IMPALA",
-        name="epn_baseline_run", # CRITICAL: Gives Ray a folder name to look for when resuming
-        resume="AUTO",           # CRITICAL: Tells Ray to fetch the latest checkpoint from Azure if it exists
         config=config.to_dict(),
-        stop={"training_iteration": 23750},
-        
-        # Checkpointing Strategy
-        checkpoint_freq=100,     # Saves every ~1.2M steps
-        checkpoint_at_end=True,  # Ensures the very final step is saved
-        
-        storage_path=AZURE_URI, 
-        
-        sync_config=SyncConfig(
-            sync_period=300,
-            sync_artifacts=True
-        ),
-        
+        resume="AUTO",
+        stop={"training_iteration": 100000},
+        checkpoint_freq=500,
+        keep_checkpoints_num=5,
+        checkpoint_at_end=True,
+        storage_path=CHECKPOINT_PATH,
         callbacks=[
-            MLflowLoggerCallback(experiment_name="epn-massive-azure")
+            MLflowLoggerCallback(
+                experiment_name="epn-impala-colab",
+                save_artifact=False
+            )
         ]
     )
